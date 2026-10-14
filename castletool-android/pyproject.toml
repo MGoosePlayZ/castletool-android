@@ -1,0 +1,27 @@
+[project]
+name = "castletool-android"
+version = "0.3.0"
+description = "Castletool for Android: browse, edit and save Castle decks via the Castle API"
+requires-python = ">=3.10"
+dependencies = [
+  "flet>=1.0.4",
+  "flet-webview>=1.0.4",
+  "requests",
+  "pillow",
+  "numpy",
+  "mido",
+  "fonttools",
+  "av",             # video + audio (replaces ffmpeg); Android build uses flet-libffmpeg
+  "sounddevice",    # live music output on Windows/macOS/Linux
+  "scipy>=1.15.3",
+]
+
+[tool.flet]
+product = "Castletool"
+org = "com.mgooseplayz"
+
+[tool.flet.app]
+path = "."
+
+[tool.flet.android]
+dependencies = ["pyjnius"]   # live music output on Android (AudioTrack)
