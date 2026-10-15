@@ -26,8 +26,8 @@ jobs:
 
       - name: Diagnose Flet CLI
         run: |
-          uv python install 3.13
-          uv sync --python 3.13
+          uv python install 3.14
+          uv sync --python 3.14
           uv run python --version
           uv run flet --version
           uv run flet --version --json
@@ -37,8 +37,8 @@ jobs:
         uses: flet-dev/flet-build-action@v1
         with:
           target: apk
-          runner-python-version: "3.13"
-          bundled-python-version: "3.13"
+          runner-python-version: "3.14"
+          bundled-python-version: "3.14"
           build-number: ${{ github.run_number }}
 
       - name: Upload APK
