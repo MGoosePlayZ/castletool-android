@@ -21,12 +21,24 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Diagnose Flet CLI
+        run: |
+          uv python install 3.13
+          uv sync --python 3.13
+          uv run python --version
+          uv run flet --version
+          uv run flet --version --json
+
       - name: Build APK
         id: build
         uses: flet-dev/flet-build-action@v1
         with:
           target: apk
-          runner-python-version: "3.14"
+          runner-python-version: "3.13"
+          bundled-python-version: "3.13"
           build-number: ${{ github.run_number }}
 
       - name: Upload APK
