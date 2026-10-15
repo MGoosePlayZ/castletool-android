@@ -1,0 +1,8 @@
+.venv/
+build/
+.flet/
+__pycache__/
+*.pyc
+storage/
+.idea/
+.vscode/
