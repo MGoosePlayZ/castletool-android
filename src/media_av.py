@@ -15,6 +15,8 @@ import io
 from pathlib import Path
 from typing import Optional
 
+import tasks
+
 try:
     import av
     HAS_AV = True
@@ -46,6 +48,65 @@ def probe_video_dimensions(path: Path) -> tuple[int, int]:
         return 64, 64
 
 
+def _video_frame_estimate(c, vs, fps: float) -> int:
+    """Best guess at the number of frames in the video stream (0 = unknown)."""
+    try:
+        if vs.frames:
+            return int(vs.frames)
+        if c.duration:
+            return int(c.duration / av.time_base * fps)
+    except Exception:
+        pass
+    return 0
+
+
+def video_frame_count(path: Path, every_n: int = 1) -> int:
+    """Estimated number of frames the import would keep (0 if it can't tell)."""
+    try:
+        with av.open(str(path)) as c:
+            vs = c.streams.video[0]
+            rate = vs.average_rate or vs.guessed_rate
+            est = _video_frame_estimate(c, vs, float(rate) if rate else 30.0)
+        return -(-est // max(1, int(every_n))) if est else 0
+    except Exception:
+        return 0
+
+
+def extract_video_frame(path: Path, index: int, width: int, height: int, every_n: int = 1,
+                        smooth: bool = False) -> bytes:
+    """ONE kept frame (index counts kept frames, i.e. every Nth) as PNG bytes.
+    Seeks near the spot instead of decoding the whole video, so previews are instant."""
+    from PIL import Image
+    every_n = max(1, int(every_n))
+    target = max(0, int(index)) * every_n               # source frame number
+    resample = Image.BILINEAR if smooth else Image.NEAREST
+    with av.open(str(path)) as c:
+        vs = c.streams.video[0]
+        rate = vs.average_rate or vs.guessed_rate
+        fps = float(rate) if rate else 30.0
+        want_t = target / fps
+        got = None
+        if target > 0:
+            try:
+                c.seek(int(want_t * av.time_base), backward=True, any_frame=False)
+            except Exception:
+                c.seek(0)
+        for frame in c.decode(vs):
+            tasks.check()
+            t = float(frame.pts * vs.time_base) if frame.pts is not None else 0.0
+            got = frame
+            if t + 0.5 / fps >= want_t:
+                break
+        if got is None:
+            raise SystemExit("No frames could be read from the video.")
+        img = got.to_image().convert("RGB")
+        if img.size != (width, height):
+            img = img.resize((width, height), resample)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+
+
 def extract_mp4_frames(path: Path, width: int, height: int, every_n: int = 1,
                        smooth: bool = False) -> tuple[list[bytes], float]:
     """Every Nth frame as PNG bytes scaled to width x height, plus effective fps."""
@@ -56,10 +117,18 @@ def extract_mp4_frames(path: Path, width: int, height: int, every_n: int = 1,
         vs = c.streams.video[0]
         rate = vs.average_rate or vs.guessed_rate
         fps = float(rate) if rate else 30.0
+        est = _video_frame_estimate(c, vs, fps)
+        keep_est = -(-est // every_n) if est else 0
         resample = Image.BILINEAR if smooth else Image.NEAREST
         for i, frame in enumerate(c.decode(vs)):
             if i % every_n:
+                tasks.check()
                 continue
+            n_done = len(frames)
+            if keep_est:
+                tasks.step(min(n_done, keep_est), keep_est, f"Processing frame {n_done + 1}/{max(keep_est, n_done + 1)}")
+            else:
+                tasks.say(f"Processing frame {n_done + 1}")
             img = frame.to_image().convert("RGB")
             if img.size != (width, height):
                 img = img.resize((width, height), resample)
@@ -103,6 +172,7 @@ def _decode_pcm(path: Path):
             raise RuntimeError("The file has no sound track.")
         rs = av.AudioResampler(format="s16p", layout="stereo", rate=SAMPLE_RATE)
         for frame in c.decode(c.streams.audio[0]):
+            tasks.check()
             for out in rs.resample(frame):
                 chunks.append(out.to_ndarray())
         for out in rs.resample(None):
@@ -144,6 +214,7 @@ def _remux_segments(path: Path, out_dir: Path, stem: str, seg_seconds: float) ->
             continue
         idx = int(float(pkt.pts * ins.time_base) // seg_seconds)
         if idx != cur:
+            tasks.say(f"Splitting segment {idx + 1}")
             if out is not None:
                 out.close()
             cur, base = idx, pkt.pts
@@ -176,10 +247,13 @@ def split_audio_mp3(path: Path, out_dir: Path, is_video: bool, *, chunk_seconds:
     else:
         if not can_encode_mp3():
             raise RuntimeError("This device can't encode MP3, so only .mp3 files can be added.")
+        tasks.say("Decoding audio", 0.0)
         pcm = _decode_pcm(path)
         seg = int(segment_seconds * SAMPLE_RATE)
+        starts = list(range(0, pcm.shape[1], seg))
         parts = []
-        for i, start in enumerate(range(0, pcm.shape[1], seg)):
+        for i, start in enumerate(starts):
+            tasks.step(i, len(starts), f"Converting segment {i + 1}/{len(starts)}")
             p = out_dir / f"{stem}_part{i:03d}.mp3"
             _encode_mp3(pcm[:, start:start + seg], p)
             parts.append(p)

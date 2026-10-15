@@ -9,8 +9,7 @@ from typing import Optional
 
 import flet as ft
 
-import blueprint_ops as ops
-import drawing
+import tasks
 import theme
 from app import App, Screen, profile_screen
 from cardbar import CardContext, card_bar, leave_card
@@ -123,55 +122,28 @@ def swatch(bg: str, width: float) -> ft.Container:
                         border_radius=width * 0.12, border=ft.Border.all(1, SEP))
 
 
-# ── thumbnails (rendered from the blueprint JSON) ──────────────────────────
-_thumb_cache: dict = {}
-
-
-def blueprint_thumb(bp_path: Path, bg: str, size: int = 96) -> Optional[bytes]:
-    st = bp_path.stat()
-    key = (str(bp_path), st.st_mtime_ns, st.st_size, bg, size)
-    if key not in _thumb_cache:
-        _thumb_cache[key] = drawing.render_png(ops.load_blueprint(bp_path), size, bg)
-        if len(_thumb_cache) > 400:
-            _thumb_cache.pop(next(iter(_thumb_cache)))
-    return _thumb_cache[key]
-
-
-def _safe_thumb(f: Path, bg: str):
-    try:
-        return blueprint_thumb(f, bg, 96)
-    except Exception:
-        return None
-
-
 # ── decks ──────────────────────────────────────────────────────────────────
 
 def clone_dialog(app: App):
     field = ft.TextField(hint_text="Deck ID or link", dense=True, border_color=SEP, width=280, autofocus=True,
                          text_style=ft.TextStyle(font_family=theme.BODY, color=MAJOR))
-    host = ft.Container()
-    state = {"busy": False}
-
-    def paint():
-        host.content = pill_button("Clone", go, filled=True, busy=state["busy"], width=280)
-        app.page.update()
+    holder: dict = {}
 
     async def go(e):
-        if not field.value or state["busy"]:
+        if not field.value:
             return
-        state["busy"] = True
-        paint()
-        path = await app.clone_ref(field.value)
-        state["busy"] = False
+        path = await app.clone_ref(field.value)      # shows the progress overlay (with its own Cancel)
         if path:
-            app.page.pop_dialog()
+            app.close_dialog(holder["dlg"])
             app.toast("Deck cloned.")
-        else:
-            paint()
 
-    paint()
-    app.dialog("Clone a deck", ft.Column([field, host], tight=True, spacing=12, width=280), [
-        ft.TextButton(content=text("Close", 14, MINOR1), on_click=lambda e: app.page.pop_dialog())])
+    holder["dlg"] = app.dialog("Clone a deck", ft.Column([
+        field, pill_button("Clone", go, filled=True, width=280)], tight=True, spacing=12, width=280),
+        [], on_close=app.cancel_all_tasks)
+
+
+ROW_H = 72          # approximate height of one deck row (for the pull-to-refresh spacer)
+PULL_TRIGGER = 80   # overscroll pixels that start a refresh
 
 
 def home_screen(app: App) -> Screen:
@@ -181,28 +153,77 @@ def home_screen(app: App) -> Screen:
     def actions(a: App):
         return [icon_button(a.avatar(36), lambda e: a.push(profile_screen(a)), "Profile", size=44)]
 
+    def bar_sig(a: App):
+        return (id(a.avatar_bytes), a.signed_in)
+
     def build(a: App) -> ft.Control:
         a.spawn(a.refresh_global())
-        tabs = []
-        for t in TABS:
-            sel = t == a.decks_tab
+        st = {"pull": 0.0, "busy": False}
+        tab_row = ft.Row(spacing=0)
+        list_host = ft.Container(expand=True)
+        spinner = ft.Container(ft.ProgressRing(width=20, height=20, stroke_width=2, color=MAJOR), height=36,
+                               alignment=ft.Alignment.CENTER, visible=False)
 
-            def pick(e, tt=t):
-                a.decks_tab = tt
-                a.refresh()
-            tabs.append(ft.Container(
-                text(t, 13, MAJOR if sel else MINOR1, bold=sel), padding=ft.Padding.symmetric(vertical=10, horizontal=12),
-                ink=True, on_click=pick))
-        items = tab_decks(a, a.decks_tab)
-        if items:
-            body: ft.Control = ft.ListView([deck_row(a, d) for d in items], spacing=0, expand=True)
-        else:
-            body = ft.Container(minor("No decks", 13), alignment=ft.Alignment.CENTER, expand=True)
-        return ft.Column([
-            ft.Container(ft.Row(tabs, scroll=ft.ScrollMode.AUTO, spacing=0), border=ft.Border(bottom=ft.BorderSide(1, SEP))),
-            body], spacing=0, expand=True)
+        def paint_tabs():
+            tabs = []
+            for t in TABS:
+                sel = t == a.decks_tab
 
-    return Screen(title="Decks", build=build, left=left, actions=actions)
+                def pick(e, tt=t):
+                    a.decks_tab = tt            # only the tab strip and the list change; the top bar stays
+                    paint_tabs()
+                    fill_list()
+                    a.page.update()
+                tabs.append(ft.Container(
+                    text(t, 11, MAJOR if sel else MINOR1, bold=sel, no_wrap=True), expand=True,
+                    alignment=ft.Alignment.CENTER, padding=ft.Padding.symmetric(vertical=10, horizontal=1),
+                    ink=True, on_click=pick,
+                    border=ft.Border(bottom=ft.BorderSide(2 if sel else 1, MAJOR if sel else SEP))))
+            tab_row.controls = tabs
+
+        async def do_refresh():
+            if st["busy"]:
+                return
+            st["busy"] = True
+            spinner.visible = True
+            a.page.update()
+            if a.signed_in:
+                await a.refresh_profile()
+                if not await a.refresh_global(force=True, repaint=False) and not a.online:
+                    a.toast("No Wi-Fi.", error=True)
+            fill_list()
+            spinner.visible = False
+            st["busy"] = False
+            a.page.update()
+
+        def on_scroll(e):
+            kind = getattr(e.event_type, "value", e.event_type)
+            if kind == "overscroll" and (e.overscroll or 0) < 0:       # dragging down past the top
+                st["pull"] += -e.overscroll
+                if st["pull"] >= PULL_TRIGGER and not st["busy"]:
+                    st["pull"] = 0.0
+                    a.spawn(do_refresh())
+            elif kind in ("start", "end"):
+                st["pull"] = 0.0
+
+        def fill_list():
+            items = tab_decks(a, a.decks_tab)
+            if not items:
+                list_host.content = ft.ListView(
+                    [ft.Container(minor("No decks", 13), alignment=ft.Alignment.CENTER, height=200),
+                     ft.Container(height=(a.page.height or 800))],
+                    expand=True, on_scroll=on_scroll, scroll_interval=10)
+                return
+            # a spacer keeps the list scrollable even when it is short, so pulling down always works
+            spacer = max(0, (a.page.height or 800) - len(items) * ROW_H - 120)
+            list_host.content = ft.ListView([deck_row(a, d) for d in items] + [ft.Container(height=spacer + 2)],
+                                            spacing=0, expand=True, on_scroll=on_scroll, scroll_interval=10)
+
+        paint_tabs()
+        fill_list()
+        return ft.Column([tab_row, spinner, list_host], spacing=0, expand=True)
+
+    return Screen(title="Decks", build=build, left=left, actions=actions, sig=bar_sig)
 
 
 def deck_row(app: App, d: dict) -> ft.Control:
@@ -254,48 +275,74 @@ def deck_screen(app: App, deck_dir: Path) -> Screen:
 def card_screen(app: App, deck_dir: Path, card_id: str) -> Screen:
     ctx = CardContext(app, deck_dir, card_id)
     card_dir = ctx.card_dir
+    thumb = {"task": None}
+
+    def stop_thumbs():
+        if thumb["task"]:
+            thumb["task"].cancel()
 
     def build(a: App) -> ft.Control:
         from screens_blueprint import blueprint_screen
-        bg = card_bg(card_dir)
+        stop_thumbs()
         files = blueprint_files(card_dir)
         if not files:
             return ft.Container(minor("No blueprints", 13), alignment=ft.Alignment.CENTER, expand=True)
+        a.icons.prune(card_dir, {f.stem for f in files})
         entries = []
         for f in files:
-            bp = read_json(f)
-            entries.append((bp.get("title") or f.stem, f, bp))
-        entries.sort(key=lambda t: t[0].lower())
-        rows, thumb_jobs = [], []
-        for name, f, bp in entries:
-            holder = ft.Container(width=52, height=52, bgcolor=bg, border_radius=8, border=ft.Border.all(1, SEP),
-                                  alignment=ft.Alignment.CENTER)
-            d2 = drawing.get_drawing2(bp)
-            if d2 and drawing.frame_count(d2):
-                thumb_jobs.append((holder, f))
+            try:
+                entries.append((a.icons.meta(card_dir, f), f))      # reads the blueprint only when it changed
+            except Exception as ex:
+                a.log(f"error: {f.name}: {ex}")
+        entries.sort(key=lambda t: t[0]["title"].lower())
+        rows, pending = [], []
+        for e, f in entries:
+            holder = ft.Container(width=52, height=52, alignment=ft.Alignment.CENTER)   # no card behind the icon
+            if e["has_drawing"]:
+                png = a.icons.png(card_dir, f)
+                if png:
+                    holder.content = ft.Image(src=png, width=48, height=48, fit=ft.BoxFit.CONTAIN,
+                                              gapless_playback=True)
+                else:
+                    pending.append((holder, f))
             else:
                 holder.content = castle_icon("brick", 22, MINOR1)
             rows.append(ft.Container(
-                content=ft.Row([holder, text(name, 15, medium=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
+                content=ft.Row([holder, text(e["title"], 15, medium=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS,
                                              expand=True)],
                                vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=12),
                 padding=ft.Padding.symmetric(vertical=8, horizontal=14),
                 border=ft.Border(bottom=ft.BorderSide(1, SEP)), ink=True,
-                on_click=lambda e, ff=f: a.push(blueprint_screen(a, ctx, ff)),
+                on_click=lambda ev, ff=f: a.push(blueprint_screen(a, ctx, ff)),
             ))
 
-        async def load_thumbs():
-            import asyncio
-            for holder, f in thumb_jobs:
-                png = await asyncio.to_thread(_safe_thumb, f, bg)
-                if png:
-                    holder.content = ft.Image(src=png, width=48, height=48, fit=ft.BoxFit.CONTAIN,
-                                              gapless_playback=True)
-                    a.page.update()
+        if pending:
+            task = tasks.Task("icons")
+            thumb["task"] = task
 
-        if thumb_jobs:
+            def make(f: Path):
+                try:
+                    with tasks.use(task):
+                        return a.icons.render(card_dir, f)
+                except tasks.Cancelled:
+                    return None
+
+            async def load_thumbs():
+                import asyncio
+                for holder, f in pending:
+                    if task.cancelled:
+                        return
+                    try:
+                        png = await asyncio.to_thread(make, f)
+                    except Exception:              # unreadable: leave the placeholder
+                        continue
+                    if png and not task.cancelled:
+                        holder.content = ft.Image(src=png, width=48, height=48, fit=ft.BoxFit.CONTAIN,
+                                                  gapless_playback=True)
+                        a.page.update()
+
             a.page.run_task(load_thumbs)
         return ft.ListView(rows, spacing=0, expand=True)
 
     return Screen(title="Card", build=build, bar=lambda a: card_bar(a, ctx, "card"),
-                  on_back=lambda: leave_card(app, ctx))
+                  on_back=lambda: leave_card(app, ctx), on_leave=stop_thumbs, sig=lambda a: ctx.bar_sig())

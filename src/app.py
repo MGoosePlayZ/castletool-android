@@ -1,6 +1,6 @@
-"""App shell: navigation, top bar, dialogs, file picking, background work, the
-signed-in profile (cached for offline use), Castle's deck list, opening/saving
-cards, deleting local decks, and the in-app card player."""
+"""App shell: navigation, top bar, dialogs (with a task progress overlay), file picking,
+background work with cancel, the signed-in profile (cached for offline use), Castle's
+deck list, opening/saving cards, deleting local decks, developer settings and logs."""
 from __future__ import annotations
 
 import asyncio
@@ -11,29 +11,30 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
 import flet as ft
 
-try:
-    import flet_webview as fwv
-except ImportError:  # desktop-only dev without the package
-    fwv = None
-
+import tasks
 import theme
 from blueprint_ops import OpError
 from castle_api import CastleAPI, CastleAPIError, OfflineError
 from deck_list import list_recent_decks
-from deck_store import clone_deck, list_local_decks, push_card, resolve_deck_ref
-from serve import LocalServe
+from deck_store import clone_deck, push_card, resolve_deck_ref
+from icons import IconStore
 from session import CardSession, deck_has_unsaved
-from theme import BG, MAJOR, MINOR1, SEP, castle_icon, minor, text, title
+from theme import BG, DANGER, MAJOR, MINOR1, SEP, castle_icon, minor, text, title
 from widgets import icon_button, pill_button
 
-WEBVIEW_PLATFORMS = (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS, ft.PagePlatform.MACOS)
 GLOBAL_LIMIT = 100
 GLOBAL_MAX_AGE = 120.0   # seconds before the deck list is refreshed again
+LOG_KEEP = 3000
+LOG_LEVELS = [(0, "Errors only"), (1, "Normal"), (2, "Verbose")]
+LEVEL_NAMES = {0: "ERROR", 1: "INFO", 2: "VERBOSE"}
+DEFAULT_SETTINGS = {"dev_mode": False, "log_level": 1}
+_CANCELLED = object()
 
 
 @dataclass
@@ -46,6 +47,7 @@ class Screen:
     on_leave: Optional[Callable] = None
     on_back: Optional[Callable] = None        # custom back handling (may be async)
     title_font: bool = True
+    sig: Optional[Callable] = None            # bar signature: the bar is only rebuilt when it changes
 
 
 def storage_root() -> Path:
@@ -75,6 +77,57 @@ def _write_json(path: Path, value) -> None:
     Path(path).write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
 
 
+class ProgressView:
+    """Greyed-out screen with a circular meter, the percentage below it and a status line."""
+
+    def __init__(self, app: "App", task: tasks.Task):
+        self.app, self.task = app, task
+        self.ring = ft.ProgressRing(width=96, height=96, stroke_width=6, color=MAJOR, bgcolor=SEP, value=None)
+        self.pct = text("", 20, MAJOR, bold=True, text_align=ft.TextAlign.CENTER)
+        self.status = minor("", 13, text_align=ft.TextAlign.CENTER, max_lines=2,
+                            overflow=ft.TextOverflow.ELLIPSIS)
+        self.cancel_btn = pill_button("Cancel", self._cancel, width=120)
+        self.dlg = ft.AlertDialog(
+            modal=True, bgcolor="#00000000", elevation=0, shadow_color="#00000000", barrier_color="#B3000000",
+            content_padding=0, title_padding=0, actions_padding=0, inset_padding=ft.Padding.all(24),
+            content=ft.Container(ft.Column([
+                self.ring, self.pct, ft.Container(self.status, width=240), self.cancel_btn,
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=14, tight=True),
+                alignment=ft.Alignment.CENTER, width=280, padding=20))
+        self.shown = False
+        task._on_update = self.update
+
+    def show(self) -> None:
+        self.app.page.show_dialog(self.dlg)
+        self.shown = True
+
+    def close(self) -> None:
+        if self.shown:
+            self.shown = False
+            self.app.close_dialog(self.dlg)
+
+    def _cancel(self, e) -> None:
+        self.task.cancel()
+        self.status.value = "Cancelling…"
+        self.cancel_btn.opacity = 0.4
+        self.cancel_btn.on_click = None
+        self.refresh()
+
+    def update(self, task: tasks.Task) -> None:
+        f = task.frac
+        self.ring.value = f
+        self.pct.value = f"{round(f * 100)}%" if f is not None else ""
+        if not task.cancelled:
+            self.status.value = task.message or task.label
+        self.refresh()
+
+    def refresh(self) -> None:
+        try:
+            self.app.page.update()
+        except Exception:
+            pass
+
+
 class App:
     def __init__(self, page: ft.Page):
         self.page = page
@@ -87,6 +140,9 @@ class App:
         self.profile_file = self.root / "profile.json"
         self.avatar_file = self.root / "profile-photo.img"
         self.global_file = self.root / "global_decks.json"
+        self.settings_file = self.root / "settings.json"
+        self.settings: dict = {**DEFAULT_SETTINGS, **(_read_json(self.settings_file, {}) or {})}
+        self.icons = IconStore(self.decks_dir)
 
         self.user: Optional[dict] = None            # {userId, username} (cached while offline)
         self.avatar_bytes: Optional[bytes] = None
@@ -96,14 +152,16 @@ class App:
         self.decks_tab = "RECENT"
         self.sessions: dict[tuple, CardSession] = {}
         self.stack: list[Screen] = []
-        self.log_lines: list[str] = []
+        self.log_entries: list[tuple[float, int, str]] = []
         self.log_targets: list[ft.Column] = []
-        self.serve_server: Optional[LocalServe] = None
+        self.active_tasks: set[tasks.Task] = set()
         self.login_cancel = False
+        self.last_work_cancelled = False
+        self._bar_sig = None
 
         self.launcher = ft.UrlLauncher()
         self.picker = ft.FilePicker()
-        self.use_webview = fwv is not None and page.platform in WEBVIEW_PLATFORMS
+        self.clipboard = ft.Clipboard()
 
         self.topbar_host = ft.Container(border=ft.Border(bottom=ft.BorderSide(1, SEP)))
         self.body = ft.Container(expand=True)
@@ -114,6 +172,7 @@ class App:
         from screens_library import home_screen
         self.page.add(ft.SafeArea(self.layout, expand=True))
         self._load_cached_session()
+        self.log(f"Castletool {theme.APP_VERSION} on {getattr(self.page.platform, 'value', self.page.platform)}", 2)
         self.push(home_screen(self))
         self.page.run_task(self._startup_refresh)
         missing = theme.missing_fonts() + theme.missing_icons()
@@ -154,6 +213,15 @@ class App:
         for f in (self.session_file, self.profile_file, self.avatar_file, self.global_file):
             f.unlink(missing_ok=True)
 
+    # ── settings ──────────────────────────────────────────────────────────
+    @property
+    def dev_mode(self) -> bool:
+        return bool(self.settings.get("dev_mode"))
+
+    def set_setting(self, key: str, value) -> None:
+        self.settings[key] = value
+        _write_json(self.settings_file, self.settings)
+
     # ── profile / connectivity ────────────────────────────────────────────
     async def refresh_profile(self):
         """Fetch username + picture. No connection keeps the cached ones (signed in,
@@ -167,7 +235,7 @@ class App:
             self._repaint()
             return
         except Exception as ex:
-            self.log(f"profile: {ex}")
+            self.log(f"error: profile: {ex}")
             return
         self.online = True
         if user is None:
@@ -183,10 +251,13 @@ class App:
         if url:
             try:
                 data = await asyncio.to_thread(self.api.download_bytes, url)
+                changed = data != self.avatar_bytes
                 self.avatar_bytes = data
                 self.avatar_file.write_bytes(data)
+                if not changed:
+                    return                       # same picture: nothing to repaint (no flicker)
             except Exception as ex:
-                self.log(f"profile picture: {ex}")
+                self.log(f"error: profile picture: {ex}")
         self._repaint()
 
     async def ensure_online(self) -> bool:
@@ -206,40 +277,48 @@ class App:
         if self.stack:
             self.refresh_bar()
 
-    def avatar(self, size: int = 36) -> ft.Control:
-        """Profile picture: thin separator-gray ring, a thin black gap, then the picture."""
-        inner = size - 8
+    def avatar(self, size: int = 36, ring: bool = True) -> ft.Control:
+        """Profile picture. With `ring`: a thin separator-gray outline, then a gap exactly as
+        thin as the outline, then the picture. Without: just the picture."""
+        pad = 1 if ring else 0
+        inner = size - 2 * (pad + (1 if ring else 0))
         if self.avatar_bytes and self.signed_in:
-            img: ft.Control = ft.Image(src=self.avatar_bytes, width=inner, height=inner, fit=ft.BoxFit.COVER)
+            img: ft.Control = ft.Image(src=self.avatar_bytes, width=inner, height=inner, fit=ft.BoxFit.COVER,
+                                       gapless_playback=True)
         else:
             img = ft.Image(src="icons/default-profile.png", width=inner, height=inner, fit=ft.BoxFit.COVER,
+                           gapless_playback=True,
                            error_content=ft.Container(castle_icon("people", inner * 0.6, MINOR1),
                                                       alignment=ft.Alignment.CENTER, width=inner, height=inner))
-        return ft.Container(
-            content=ft.Container(img, width=inner, height=inner, border_radius=inner / 2,
-                                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS),
-            width=size, height=size, padding=3, alignment=ft.Alignment.CENTER, border_radius=size / 2,
-            border=ft.Border.all(1, SEP))
+        pic = ft.Container(img, width=inner, height=inner, border_radius=inner / 2,
+                           clip_behavior=ft.ClipBehavior.ANTI_ALIAS)
+        if not ring:
+            return pic
+        return ft.Container(content=pic, width=size, height=size, padding=pad, alignment=ft.Alignment.CENTER,
+                            border_radius=size / 2, border=ft.Border.all(1, SEP))
 
     # ── Castle's deck list ────────────────────────────────────────────────
-    async def refresh_global(self, force: bool = False):
+    async def refresh_global(self, force: bool = False, repaint: bool = True) -> bool:
         if not self.api.token or not (self.user or {}).get("userId"):
-            return
+            return False
         if not force and self.global_loaded_at and time.monotonic() - self.global_loaded_at < GLOBAL_MAX_AGE:
-            return
+            return False
         self.global_loaded_at = time.monotonic()     # also on failure: never hammer Castle / loop on rebuilds
         try:
             decks = await asyncio.to_thread(list_recent_decks, self.api, GLOBAL_LIMIT, self.user["userId"])
         except OfflineError:
             self.online = False
-            return
+            return False
         except Exception as ex:
-            self.log(f"decks: {ex}")
-            return
+            self.log(f"error: decks: {ex}")
+            return False
         self.online = True
         self.global_decks = decks
         _write_json(self.global_file, decks)
-        self.refresh_body_if("Decks")
+        self.log(f"Deck list refreshed: {len(decks)} decks", 2)
+        if repaint:
+            self.refresh_body_if("Decks")
+        return True
 
     # ── navigation ────────────────────────────────────────────────────────
     def push(self, screen: Screen):
@@ -254,7 +333,18 @@ class App:
             try:
                 leaving.on_leave()
             except Exception as ex:
-                self.log(f"[leave] {ex}")
+                self.log(f"[leave] {ex}", 2)
+        self._show()
+
+    def go_home(self):
+        """Back to the first (Decks) screen, closing everything above it."""
+        while len(self.stack) > 1:
+            leaving = self.stack.pop()
+            if leaving.on_leave:
+                try:
+                    leaving.on_leave()
+                except Exception as ex:
+                    self.log(f"[leave] {ex}", 2)
         self._show()
 
     def go_back(self):
@@ -270,12 +360,23 @@ class App:
     def refresh(self):
         self._show()
 
+    def refresh_body(self):
+        """Rebuild only the screen body (the top bar and its images stay untouched)."""
+        self.body.content = self.stack[-1].build(self)
+        self.page.update()
+
     def refresh_body_if(self, screen_title: str):
         if self.stack and self.stack[-1].title == screen_title:
             self._show()
 
     def refresh_bar(self):
-        self.topbar_host.content = self._bar(self.stack[-1])
+        s = self.stack[-1]
+        sig = (id(s), s.sig(self) if s.sig else None)
+        if s.sig and sig == self._bar_sig:
+            self.page.update()
+            return
+        self._bar_sig = sig
+        self.topbar_host.content = self._bar(s)
         self.page.update()
 
     def _bar(self, s: Screen) -> ft.Control:
@@ -298,29 +399,84 @@ class App:
     def _show(self):
         s = self.stack[-1]
         self.log_targets.clear()
+        self._bar_sig = (id(s), s.sig(self) if s.sig else None)
         self.topbar_host.content = self._bar(s)
         self.body.content = s.build(self)
         self.page.update()
 
-    # ── helpers ───────────────────────────────────────────────────────────
-    def log(self, msg: str):
+    # ── logging ───────────────────────────────────────────────────────────
+    def log(self, msg: str, level: int = 1):
+        """level 0 = errors/warnings, 1 = normal, 2 = verbose. Everything is recorded;
+        the Developer settings choose how much the log boxes show."""
         for line in str(msg).splitlines() or [""]:
-            self.log_lines.append(line)
-            del self.log_lines[:-200]
-            for col in self.log_targets:
-                col.controls.append(minor(line, 11, selectable=True))
-                del col.controls[:-200]
-        try:
-            self.page.update()
-        except Exception:
-            pass
+            low = line.lower()
+            lvl = 0 if low.startswith(("error", "warning", "failed")) else level
+            self.log_entries.append((time.time(), lvl, line))
+            del self.log_entries[:-LOG_KEEP]
+            if self.dev_mode and lvl <= self.settings.get("log_level", 1):
+                for col in self.log_targets:
+                    col.controls.append(minor(line, 11, selectable=True))
+                    del col.controls[:-300]
+        if self.dev_mode and self.log_targets:
+            try:
+                self.page.update()
+            except Exception:
+                pass
 
-    def log_view(self, height: Optional[int] = 140) -> ft.Column:
-        col = ft.Column([minor(l, 11, selectable=True) for l in self.log_lines[-60:]], spacing=2,
-                        scroll=ft.ScrollMode.AUTO, height=height, auto_scroll=True)
+    def visible_log_lines(self, limit: int = 120) -> list[str]:
+        lvl = self.settings.get("log_level", 1)
+        return [l for _t, v, l in self.log_entries if v <= lvl][-limit:]
+
+    def log_view(self, height: Optional[int] = 140) -> ft.Control:
+        """Scrolling log text box with a copy button at its top right. Hidden unless
+        Developer mode is on."""
+        if not self.dev_mode:
+            return ft.Container(height=0)
+        col = ft.Column([minor(l, 11, selectable=True) for l in self.visible_log_lines()], spacing=2,
+                        scroll=ft.ScrollMode.AUTO, auto_scroll=True)
         self.log_targets.append(col)
-        return col
 
+        async def copy(e):
+            await self.clipboard.set("\n".join(c.value for c in col.controls))
+            self.toast("Logs copied.")
+
+        return ft.Container(
+            ft.Stack([ft.Container(col, left=0, top=0, right=34, bottom=0),
+                      ft.Container(icon_button(castle_icon("copy", 18, MINOR1), copy, "Copy logs", size=32),
+                                   right=0, top=0)], expand=True),
+            height=height, padding=ft.Padding(left=10, top=4, right=4, bottom=8), border=ft.Border.all(1, SEP),
+            border_radius=10)
+
+    def log_text(self) -> str:
+        """Every recorded line (all levels), timestamped."""
+        head = [f"Castletool {theme.APP_VERSION}", f"platform: {getattr(self.page.platform, 'value', self.page.platform)}",
+                f"saved: {datetime.now():%Y-%m-%d %H:%M:%S}", ""]
+        body = [f"[{datetime.fromtimestamp(t):%Y-%m-%d %H:%M:%S}] [{LEVEL_NAMES.get(v, 'INFO')}] {l}"
+                for t, v, l in self.log_entries]
+        return "\n".join(head + body) + "\n"
+
+    async def save_logs(self):
+        data = self.log_text().encode("utf-8")
+        name = f"castletool-logs-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        try:
+            path = await self.picker.save_file(dialog_title="Save logs", file_name=name,
+                                               file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=["txt"],
+                                               src_bytes=data)
+            if not path:
+                return
+            if self.page.platform not in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS):
+                Path(path).write_bytes(data)           # desktop: the picker only returns the path
+            self.toast("Logs saved.")
+        except Exception as ex:
+            fallback = self.root / "logs" / name        # picker unavailable: keep them in app storage
+            try:
+                fallback.parent.mkdir(parents=True, exist_ok=True)
+                fallback.write_bytes(data)
+                self.toast(f"Saved to {fallback}")
+            except OSError:
+                self.toast(f"Couldn't save logs: {ex}", error=True)
+
+    # ── helpers ───────────────────────────────────────────────────────────
     def spawn(self, awaitable):
         async def runner():
             await awaitable
@@ -328,9 +484,16 @@ class App:
 
     async def run(self, fn, *args, report: bool = True):
         """Run blocking `fn` in a worker thread. Errors are logged and toasted;
-        returns None on failure (so make `fn` return something truthy)."""
+        returns None on failure or cancel (so make `fn` return something truthy)."""
+        def guarded():
+            try:
+                return fn(*args)
+            except tasks.Cancelled:
+                return _CANCELLED
+
         try:
-            return await asyncio.to_thread(fn, *args)
+            r = await asyncio.to_thread(guarded)
+            return None if r is _CANCELLED else r
         except OfflineError:
             self.online = False
             self.log("error: no connection to Castle")
@@ -341,18 +504,75 @@ class App:
             if report:
                 self.toast(str(ex), error=True)
         except Exception as ex:
-            self.log(f"ERROR: {ex}")
+            self.log(f"error: {ex}")
             if report:
                 self.toast(str(ex), error=True)
         return None
+
+    async def work(self, label: str, fn, *args, progress: bool = True, report: bool = True):
+        """Run `fn(task, *args)` on a worker thread with a cancellable Task. While it runs
+        the screen is greyed out and a circular meter shows percentage and a status line.
+        Returns fn's result, or None if it failed or was cancelled."""
+        task = tasks.Task(label, on_message=lambda m: self.log(f"[{label}] {m}", 2))
+        view = ProgressView(self, task) if progress else None
+        self.active_tasks.add(task)
+        t0 = time.monotonic()
+        self.log(f"{label}: started", 2)
+        if view:
+            view.show()
+            view.update(task)
+        try:
+            result = await self.run(fn, task, *args, report=report)
+        finally:
+            self.active_tasks.discard(task)
+            if view:
+                view.close()
+        took = time.monotonic() - t0
+        self.last_work_cancelled = task.cancelled
+        if task.cancelled:
+            self.log(f"{label}: cancelled after {took:.1f}s")
+            return None
+        self.log(f"{label}: {'done' if result is not None else 'failed'} in {took:.1f}s", 2)
+        return result
+
+    def cancel_all_tasks(self):
+        for t in list(self.active_tasks):
+            t.cancel()
 
     def toast(self, msg: str, error: bool = False):
         self.page.show_dialog(ft.SnackBar(content=text(msg, 13, MAJOR), bgcolor=BG, duration=3500,
                                           shape=theme.popup_shape(10)))
 
-    def dialog(self, heading: str, content: ft.Control, actions: list):
-        self.page.show_dialog(ft.AlertDialog(bgcolor=BG, shape=theme.popup_shape(), title=text(heading, 18, bold=True),
-                                             content=content, actions=actions))
+    def close_dialog(self, dlg: Optional[ft.AlertDialog] = None):
+        """Close one specific dialog (or the topmost when none is given)."""
+        if dlg is None:
+            self.page.pop_dialog()
+            return
+        try:
+            dlg.open = False
+            dlg.update()
+        except Exception:
+            self.page.pop_dialog()
+
+    def dialog(self, heading: Optional[str], content: ft.Control, actions: Optional[list] = None,
+               on_close: Optional[Callable] = None, closable: bool = True) -> ft.AlertDialog:
+        """Modal with a ✕ at the top left and the title to its right; confirm buttons go in
+        `actions`. `on_close` runs when the dialog goes away by any route (✕, tapping outside,
+        or after a confirm), so it must be safe to call after success (cancel flags are)."""
+        holder: dict = {}
+        head: list[ft.Control] = []
+        if closable:
+            head.append(icon_button(castle_icon("close", 22), lambda e: self.close_dialog(holder["dlg"]), size=36))
+        if heading:
+            head.append(text(heading, 18, bold=True, expand=True, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS))
+        dlg = ft.AlertDialog(
+            bgcolor=BG, shape=theme.popup_shape(),
+            title=ft.Row(head, spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER) if head else None,
+            title_padding=ft.Padding(left=10, top=10, right=16, bottom=0), content=content,
+            actions=actions or [], on_dismiss=(lambda e: on_close()) if on_close else None)
+        holder["dlg"] = dlg
+        self.page.show_dialog(dlg)
+        return dlg
 
     def confirm(self, heading: str, body: str, ok_label: str, on_ok):
         async def _ok(e):
@@ -362,8 +582,12 @@ class App:
                 await r
 
         self.dialog(heading, text(body, 14, MINOR1) if body else ft.Container(height=0), [
-            ft.TextButton(content=text("Cancel", 14, MINOR1), on_click=lambda e: self.page.pop_dialog()),
             ft.TextButton(content=text(ok_label, 14, MAJOR, bold=True), on_click=_ok)])
+
+    def info(self, heading: str, message: str):
+        self.dialog(heading, text(message, 14, MINOR1), [
+            ft.TextButton(content=text("OK", 14, MAJOR, bold=True), on_click=lambda e: self.page.pop_dialog())],
+            closable=False)
 
     async def pick(self, extensions: Optional[list[str]] = None, title_: str = "Choose a file") -> Optional[Path]:
         kwargs = dict(dialog_title=title_, allow_multiple=False)
@@ -383,10 +607,14 @@ class App:
         self.online = True
         self.global_loaded_at = 0.0
         await self.refresh_profile()
-        await self.refresh_global(force=True)
+        await self.refresh_global(force=True, repaint=False)
 
     async def sign_in_password(self, username: str, password: str) -> bool:
+        self.login_cancel = False
         user = await self.run(lambda: self.api.login_password(username.strip(), password))
+        if self.login_cancel:                      # cancelled while waiting: drop the result
+            self.api.token = None
+            return False
         if not user:
             self.api.token = None
             return False
@@ -401,7 +629,8 @@ class App:
         await self.launcher.launch_url(info["url"])
         user = await self.run(lambda: self.api.wait_for_login(
             info["pollToken"], info["verifier"], cancelled=lambda: self.login_cancel))
-        if not user:
+        if not user or self.login_cancel:
+            self.api.token = None
             return False
         await self._signed_in_as(user)
         return True
@@ -415,13 +644,15 @@ class App:
         for key in [k for k in self.sessions if k[0] == deck_id]:
             del self.sessions[key]
 
-    def fresh_clone(self, deck_id: str) -> Path:
-        """Clone into a scratch folder, then swap it in: a failed clone never destroys
-        the copy already on the device."""
+    def fresh_clone(self, deck_id: str, task: Optional[tasks.Task] = None) -> Path:
+        """Clone into a scratch folder, then swap it in: a failed or cancelled clone never
+        destroys the copy already on the device."""
         scratch = self.decks_dir / ".incoming"
         shutil.rmtree(scratch, ignore_errors=True)
         try:
-            clone_deck(self.api, deck_id, scratch, self.log)
+            with tasks.use(task):
+                clone_deck(self.api, deck_id, scratch, self.log)
+                tasks.say("Finishing up", 0.98)
             target = self.decks_dir / deck_id
             shutil.rmtree(target, ignore_errors=True)
             shutil.move(str(scratch / deck_id), str(target))
@@ -438,7 +669,7 @@ class App:
         if not deck_id:
             self.toast("That isn't a deck link.", error=True)
             return None
-        path = await self.run(lambda: self.fresh_clone(deck_id))
+        path = await self.work("Cloning deck", lambda task: self.fresh_clone(deck_id, task))
         if path:
             self.global_loaded_at = 0.0
             self.refresh_body_if("Decks")
@@ -456,15 +687,11 @@ class App:
             if not self.online:
                 await self.refresh_profile()
             if self.online:
-                self.body.content = ft.Container(ft.ProgressRing(color=MAJOR, width=28, height=28, stroke_width=2),
-                                                 alignment=ft.Alignment.CENTER, expand=True)
-                self.page.update()
-                path = await self.run(lambda: self.fresh_clone(deck_id))
+                path = await self.work("Opening deck", lambda task: self.fresh_clone(deck_id, task))
                 if path:
                     self.push(deck_screen(self, path))
                     return
-                self._show()
-                if not has_local:
+                if not has_local or self.last_work_cancelled:
                     return
         if has_local:
             self.push(deck_screen(self, local_dir))
@@ -481,8 +708,9 @@ class App:
     async def delete_deck(self, deck_dir: Path):
         try:
             await asyncio.to_thread(shutil.rmtree, deck_dir)
+            await asyncio.to_thread(self.icons.delete_deck, deck_dir)
         except OSError as ex:
-            self.log(f"ERROR: {ex}")
+            self.log(f"error: {ex}")
             self.toast(str(ex), error=True)
             return
         self.clear_sessions(deck_dir.name)
@@ -503,49 +731,27 @@ class App:
             return False
         ctx.saving = True
         self.refresh_bar()
-        ok = await self.run(lambda: push_card(self.api, ctx.deck_dir, ctx.card_id, self.log) or True)
+
+        def do(task):
+            with tasks.use(task):
+                push_card(self.api, ctx.deck_dir, ctx.card_id, self.log)
+            return True
+
+        ok = await self.work("Saving card", do)
         ctx.saving = False
         if ok:
             ctx.session.mark_saved()
         self.refresh_bar()
         return bool(ok)
 
-    # ── player ────────────────────────────────────────────────────────────
-    def stop_serve(self):
-        srv, self.serve_server = self.serve_server, None
-        if srv:
-            try:
-                srv.stop()
-            except Exception as ex:
-                self.log(f"[serve] {ex}")
-
-    async def play_card(self, ctx):
-        from cardbar import player_screen
-        if not self.use_webview:
-            self.toast("The player needs the Android app.", error=True)
-            return
-        if self.serve_server:
-            self.stop_serve()
-
-        def start():
-            srv = LocalServe(ctx.deck_dir, username=(self.user or {}).get("username", ""),
-                             cache_dir=self.cache_dir, on_log=self.log, card_id=ctx.card_id)
-            srv.start()
-            return srv
-
-        srv = await self.run(start)
-        if not srv:
-            return
-        self.serve_server = srv
-        self.push(player_screen(self, ctx, srv.url))
-
 
 # ── profile screen ─────────────────────────────────────────────────────────
 
 def profile_screen(app: App) -> Screen:
-    name = title("", 24)
+    name = title("", 22, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
     status = minor("", 13)
-    host = ft.Column(spacing=10, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+    host = ft.Column(spacing=10, horizontal_alignment=ft.CrossAxisAlignment.START)
+    form = ft.Column(spacing=10, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
     user_f = ft.TextField(hint_text="Username or email", dense=True, border_color=SEP, width=280,
                           text_style=ft.TextStyle(font_family=theme.BODY, color=MAJOR))
     pass_f = ft.TextField(hint_text="Password", password=True, can_reveal_password=True, dense=True,
@@ -556,39 +762,43 @@ def profile_screen(app: App) -> Screen:
         if app.signed_in:
             name.value = (app.user or {}).get("username") or ""
             status.value = "" if app.online else "No Wi-Fi"
-            host.controls = [pill_button("Sign out", on_sign_out)]
+            host.controls = [pill_button("Sign out", on_sign_out, width=120)]
+            form.controls = []
         else:
-            name.value = ""
-            status.value = "Not signed in"
-            host.controls = [
+            name.value = "Not signed in"
+            status.value = ""
+            host.controls = []
+            form.controls = [
                 user_f, pass_f,
                 pill_button("Sign in", on_sign_in, filled=True, busy=state["busy"], width=280),
                 pill_button("Sign in with browser", on_sign_in_browser, disabled=state["busy"], width=280),
-            ]
+            ] + ([pill_button("Cancel", on_cancel_login, width=280)] if state["busy"] else [])
         app.page.update()
+
+    def on_cancel_login(e):
+        app.login_cancel = True
+        state["busy"] = False
+        paint()
+
+    async def finish_login(ok: bool):
+        state["busy"] = False
+        pass_f.value = ""
+        if ok:
+            app.go_home()                       # signed in: straight back to the Decks tabs
+        else:
+            paint()
 
     async def on_sign_in(e):
         if not user_f.value or not pass_f.value:
             return
         state["busy"] = True
         paint()
-        ok = await app.sign_in_password(user_f.value, pass_f.value)
-        state["busy"] = False
-        pass_f.value = ""
-        if ok:
-            app.refresh()
-        else:
-            paint()
+        await finish_login(await app.sign_in_password(user_f.value, pass_f.value))
 
     async def on_sign_in_browser(e):
         state["busy"] = True
         paint()
-        ok = await app.sign_in_browser()
-        state["busy"] = False
-        if ok:
-            app.refresh()
-        else:
-            paint()
+        await finish_login(await app.sign_in_browser())
 
     async def on_sign_out(e):
         await app.sign_out()
@@ -599,15 +809,62 @@ def profile_screen(app: App) -> Screen:
             await app.refresh_profile()
             app.refresh()
 
+    def dev_section(a: App) -> list[ft.Control]:
+        def toggle(e):
+            a.set_setting("dev_mode", bool(e.control.value))
+            a.refresh_body()
+
+        sw = ft.Switch(value=a.dev_mode, on_change=toggle, active_color=BG, active_track_color=MAJOR,
+                       inactive_thumb_color=MINOR1, inactive_track_color=BG, track_outline_color=SEP)
+        out: list[ft.Control] = [ft.Row([text("Developer mode", 14, expand=True), sw])]
+        if not a.dev_mode:
+            return out
+
+        def level(e):
+            a.set_setting("log_level", int(e.control.value))
+            a.refresh_body()
+
+        out.append(ft.Dropdown(
+            value=str(a.settings.get("log_level", 1)), label="Log verbosity", dense=True, border_color=SEP,
+            options=[ft.dropdown.Option(key=str(k), text=t) for k, t in LOG_LEVELS], on_select=level,
+            text_style=ft.TextStyle(font_family=theme.BODY, color=MAJOR, size=14), width=260))
+
+        async def save(e):
+            await a.save_logs()
+
+        def clear(e):
+            a.log_entries.clear()
+            a.refresh_body()
+
+        out.append(ft.Row([pill_button("Save all logs", save), pill_button("Clear", clear)], spacing=8, wrap=True))
+        out.append(minor("Log", 11))
+        out.append(a.log_view(240))
+        return out
+
+    def links(a: App) -> ft.Control:
+        def link(label: str, url: str):
+            async def go(e):
+                await a.launcher.launch_url(url)
+            return ft.Container(text(label, 13, MAJOR, medium=True), padding=ft.Padding.symmetric(vertical=8, horizontal=10),
+                                ink=True, border_radius=8, on_click=go)
+        return ft.Column([
+            ft.Row([link(l, u) for l, u in theme.CASTLE_LINKS], alignment=ft.MainAxisAlignment.CENTER, wrap=True),
+            minor(theme.DISCLAIMER, 11, text_align=ft.TextAlign.CENTER),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6)
+
     def build(a: App) -> ft.Control:
         paint()
+        head = ft.Row([
+            ft.GestureDetector(a.avatar(88, ring=False), on_tap=on_retry),
+            ft.Column([name, status, host], spacing=6, expand=True, horizontal_alignment=ft.CrossAxisAlignment.START),
+        ], spacing=16, vertical_alignment=ft.CrossAxisAlignment.START)
         return ft.Column([
-            ft.Container(ft.Column([
-                ft.GestureDetector(a.avatar(88), on_tap=on_retry), name, status, host,
-            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=10), padding=ft.Padding(top=24, bottom=16),
-                alignment=ft.Alignment.CENTER),
+            ft.Container(ft.Column([head, form], spacing=14, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+                         padding=ft.Padding(left=16, right=16, top=20, bottom=16)),
             theme.separator(),
-            ft.Container(ft.Column([minor("Log", 11), a.log_view(220)], spacing=4), padding=14),
+            ft.Container(ft.Column(dev_section(a), spacing=10), padding=14),
+            theme.separator(),
+            ft.Container(links(a), padding=ft.Padding(left=16, right=16, top=12, bottom=28)),
         ], scroll=ft.ScrollMode.AUTO, spacing=0)
 
     return Screen(title="Profile", build=build)

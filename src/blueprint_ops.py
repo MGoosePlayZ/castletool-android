@@ -10,6 +10,7 @@ Everything here blocks: call from a worker thread.
 from __future__ import annotations
 
 import copy
+import io
 import json
 import re
 import shutil
@@ -21,6 +22,7 @@ from typing import Callable, Optional
 import castletool_core as ct
 import drawing
 import media_av
+import tasks
 
 media_av.install(ct)   # PyAV instead of ffmpeg/ffprobe subprocesses (works on phones)
 
@@ -56,11 +58,15 @@ def _hook(log: Log, token: Optional[str]) -> None:
 
 def _guard(fn):
     """Serialize ops (they patch module globals) and turn SystemExit into OpError."""
-    def wrapper(*args, log: Log = print, token: Optional[str] = None, **kwargs):
+    def wrapper(*args, log: Log = print, token: Optional[str] = None, task: Optional[tasks.Task] = None, **kwargs):
+        if task is not None:
+            task.check()                       # cancelled while waiting for the lock? never start
         with _patch_lock:
             _hook(log, token)
             try:
-                return fn(*args, log=log, **kwargs)
+                with tasks.use(task):
+                    tasks.check()
+                    return fn(*args, log=log, **kwargs)
             except SystemExit as e:
                 raise OpError(str(e.code) if e.code not in (None, 0, 1) else "Operation failed (see log).")
     wrapper.__name__ = fn.__name__
@@ -135,6 +141,7 @@ def inspect_media(src: Path, *, log: Log) -> dict:
             "unsupported": unsupported,
             "has_audio": has_audio,
             "size": max(f.stat().st_size for f in files),
+            "frames": _frames_in(files[0], cat),      # frames inside the first file (animation / video)
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -209,9 +216,55 @@ def _media_state(o: dict, cat: str, files, ico_sizes: dict, multi: bool) -> dict
     return st
 
 
+def _frames_in(f: Path, cat: str) -> int:
+    """How many frames one file holds (1 for stills, SVG and anything unreadable)."""
+    try:
+        if cat == "video":
+            return max(1, media_av.video_frame_count(f, 1)) if ct.HAS_FFMPEG else 1
+        if cat == "animation":
+            with ct.Image.open(f) as im:
+                return max(1, int(getattr(im, "n_frames", 1) or 1))
+    except Exception:
+        pass
+    return 1
+
+
+def preview_frame_count(info: dict, opts: dict) -> int:
+    """How many different frames the import preview can show with these settings."""
+    cat, every = info["category"], max(1, int(float(opts.get("every") or 1)))
+    if cat in ("image", "vector") and info["count"] > 1 and opts.get("layout", "frames") == "frames":
+        return info["count"]
+    if cat in ("animation", "video"):
+        return max(1, -(-int(info.get("frames") or 1) // every))
+    return 1
+
+
+def _one_frame_png(f: Path, cat: str, st: dict, ico_size, index: int) -> Optional[tuple]:
+    """Decode ONLY frame `index` of `f`, scaled like the import would. Returns (png, w, h)."""
+    width, height = ct.scaled_size(ct.visual_native_size(f, cat, ico_size), st["scale"])
+    every = max(1, int(st["every"]))
+    if cat == "video":
+        png = media_av.extract_video_frame(f, index, width, height, every_n=every, smooth=st["smooth"])
+    else:
+        resample = ct.Image.BILINEAR if st["smooth"] else ct.Image.NEAREST
+        with ct.Image.open(f) as img:
+            if ico_size:
+                img.size = tuple(ico_size)
+            n = int(getattr(img, "n_frames", 1) or 1)
+            if getattr(img, "is_animated", False):
+                img.seek(min(index * every, n - 1))
+            buf = io.BytesIO()
+            img.convert("RGBA").resize((width, height), resample).save(buf, format="PNG")
+            png = buf.getvalue()
+    if st["quantize"]:
+        png = ct.quantize_frame(png, st["quantize"])
+    return png, width, height
+
+
 @_guard
-def preview_media(src: Path, opts: dict, *, log: Log, bg=None, size: int = 220) -> Optional[bytes]:
-    """PNG of what Import would draw (first file, first frame), for the import modal."""
+def preview_media(src: Path, opts: dict, *, log: Log, bg=None, size: int = 220, frame: int = 0) -> Optional[bytes]:
+    """PNG of what Import would draw, for the import modal. Renders only frame
+    number `frame` (never the whole video / animation), so it stays quick."""
     o = {**DEFAULT_MEDIA_OPTS, **(opts or {})}
     src = Path(src)
     tmp = Path(tempfile.mkdtemp(prefix="castletool-preview-"))
@@ -225,9 +278,18 @@ def preview_media(src: Path, opts: dict, *, log: Log, bg=None, size: int = 220) 
             return None
         if cat == "video" and not ct.HAS_FFMPEG:
             return None
-        ico = _ico_sizes(files[:1])
-        st = _media_state(o, cat, files[:1], ico, False)
-        d2, _summary = ct.render_visual(files[0], cat, st, ico.get(files[0]))
+        frame = max(0, int(frame))
+        by_file = len(files) > 1 and cat in ("image", "vector") and o["layout"] == "frames"
+        f = files[min(frame, len(files) - 1)] if by_file else files[0]
+        ico = _ico_sizes([f])
+        st = _media_state(o, cat, [f], ico, False)
+        tasks.check()
+        if cat == "vector":
+            d2, _summary = ct.render_visual(f, cat, st, ico.get(f))
+        else:
+            png, w, h = _one_frame_png(f, cat, st, ico.get(f), 0 if by_file else frame)
+            d2 = ct.build_drawing2([png], 1.0, w, h, "still", scale=st["fixed_scale"])
+        tasks.check()
         return drawing.render_png(d2, size, bg)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -331,22 +393,28 @@ def import_media(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: L
 
         if frames_mode:
             try:
-                if cat == "vector":
-                    d2, summary = ct.render_svg_frames_actor(files, st, fps)
-                else:
-                    d2, summary = ct.render_frames_actor(files, st, ico_sizes, fps)
+                with tasks.span(0.0, 0.95):
+                    if cat == "vector":
+                        d2, summary = ct.render_svg_frames_actor(files, st, fps)
+                    else:
+                        d2, summary = ct.render_frames_actor(files, st, ico_sizes, fps)
             except Exception as e:
                 raise OpError(f"Could not import: {e}")
             actor["actorBlueprint"]["components"]["Drawing2"] = d2
             log(summary)
+            tasks.say("Saving blueprint", 0.97)
             write_blueprint(bp_path, actor)
             ct.maybe_delete_placeholder_script(card_dir, bp_path)
             return [bp_path]
 
         used_selected = False
-        for f in files:
+        for fi, f in enumerate(files):
+            tasks.check()
+            has_aud = want_audio and f in audio_files
+            lo, hi = fi / len(files), (fi + 1) / len(files)
             try:
-                d2, summary = ct.render_visual(f, cat, st, ico_sizes.get(f))
+                with tasks.span(lo, lo + (hi - lo) * (0.5 if has_aud else 0.95)):
+                    d2, summary = ct.render_visual(f, cat, st, ico_sizes.get(f))
             except Exception as e:
                 log(f"error: {f.name}: {e}")
                 continue
@@ -356,9 +424,10 @@ def import_media(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: L
                 ct.strip_audio_rules(t_actor)
             t_actor["actorBlueprint"]["components"]["Drawing2"] = d2
             log(summary)
-            if want_audio and f in audio_files:
-                if not ct.attach_audio(t_actor, f, is_video=True):
-                    log("warning: continuing with silent video.")
+            if has_aud:
+                with tasks.span(lo + (hi - lo) * 0.5, hi):
+                    if not ct.attach_audio(t_actor, f, is_video=True):
+                        log("warning: continuing with silent video.")
             write_blueprint(t_path, t_actor)
             if is_sel:
                 ct.maybe_delete_placeholder_script(card_dir, bp_path)
@@ -431,12 +500,15 @@ def import_font(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Lo
         base = copy.deepcopy(actor)
         used_selected = False
         written: list[Path] = []
-        for fp, font in fonts:
+        for fi, (fp, font) in enumerate(fonts):
+            tasks.check()
+            lo, hi = fi / len(fonts), (fi + 1) / len(fonts)
             log(f"Rendering {len(codepoints)} glyph(s) from {fp.name}...")
             count, missing, d2 = 0, 0, None
             if bitmap:
                 try:
-                    frames, (gw, gh), missing = ct.render_font_bitmap(fp, font, codepoints, px, smooth, color)
+                    with tasks.span(lo, lo + (hi - lo) * 0.95):
+                        frames, (gw, gh), missing = ct.render_font_bitmap(fp, font, codepoints, px, smooth, color)
                 except Exception as e:
                     log(f"error: {fp.name}: {e}")
                     continue
@@ -447,7 +519,9 @@ def import_font(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Lo
                 cmap, glyph_set = font.getBestCmap(), font.getGlyphSet()
                 ppu = font["head"].unitsPerEm / 10.0  # 1 em = 10 Castle units
                 glyph_frames = []
-                for cp in codepoints:
+                for gi, cp in enumerate(codepoints):
+                    with tasks.span(lo, lo + (hi - lo) * 0.95):
+                        tasks.step(gi, len(codepoints), f"Rendering glyph {gi + 1}/{len(codepoints)}")
                     name = cmap.get(cp)
                     if not name or name not in glyph_set:
                         missing += 1
@@ -494,7 +568,8 @@ def import_midi(bp_path: Path, card_dir: Path, midi_path: Path, *, log: Log) -> 
         mid = ct.mido.MidiFile(midi_path, clip=True)
     except Exception as e:
         raise OpError(f"Could not read MIDI: {e}")
-    music = ct.build_music(mid)
+    with tasks.span(0.0, 0.95):
+        music = ct.build_music(mid)
     log(f"MIDI ready: {len(music['song']['patterns'])} patterns, {len(music['song']['tracks'])} tracks")
     actor = load_blueprint(bp_path)
     ensure_components(actor)["Music"] = music
@@ -552,11 +627,14 @@ def import_audio(bp_path: Path, card_dir: Path, src: Path, *, log: Log) -> list[
         base = copy.deepcopy(actor)
         used_selected = False
         written: list[Path] = []
-        for f in files:
+        for fi, f in enumerate(files):
+            tasks.check()
             t_path, t_actor, is_sel = ct.next_target(card_dir, bp_path, actor, base, used_selected, f.stem)
             if not is_sel:
                 ct.strip_audio_rules(t_actor)
-            if not ct.attach_audio(t_actor, f, is_video=False):
+            with tasks.span(fi / len(files), (fi + 1) / len(files)):
+                ok = ct.attach_audio(t_actor, f, is_video=False)
+            if not ok:
                 continue
             used_selected = True
             write_blueprint(t_path, t_actor)

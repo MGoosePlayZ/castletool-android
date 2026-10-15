@@ -1,12 +1,11 @@
 [project]
 name = "castletool-android"
-version = "0.3.0"
+version = "0.4.0"
 description = "Castletool for Android: browse, edit and save Castle decks via the Castle API"
 readme = "README.md"
-requires-python = "==3.13.*"          # Flet bundles the highest supported Python that satisfies this (numpy doesn'y work on 3.14)
+requires-python = ">=3.13"          # Flet bundles the highest supported Python that satisfies this (3.14)
 dependencies = [
   "flet==1.0.4",
-  "flet-webview==1.0.4",            # in-app card player (Android/iOS/macOS)
   "requests",
   "mido",
   "fonttools",
@@ -32,9 +31,6 @@ path = "src"                        # main.py, assets/ and player/ live here
 [tool.flet.android]
 target_arch = ["arm64-v8a"]         # phones; drops the x86/32-bit builds (smaller APK, faster build)
 dependencies = ["pyjnius==1.7.0"]   # live music output through Android's AudioTrack
-
-[tool.flet.android.manifest_application]
-usesCleartextTraffic = "true"       # the in-app player loads http://localhost
 
 # Live music output when you build a desktop version
 [tool.flet.windows]

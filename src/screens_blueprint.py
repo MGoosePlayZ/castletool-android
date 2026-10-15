@@ -14,12 +14,13 @@ import castletool_core as ct
 import drawing
 import live_synth
 import synth
+import tasks
 import theme
 from app import Screen
 from cardbar import CardContext, card_bar
 from screens_library import card_bg
 from theme import BG, MAJOR, MINOR1, SEP, castle_icon, minor, text
-from widgets import ColorField, NumberBox, icon_button, info_button, pill_button
+from widgets import ColorField, NumberBox, icon_button, info_note, pill_button
 
 ARCHIVES = {"zip", "tar", "gz", "tgz", "bz2", "xz", "tbz2", "txz"}
 MEDIA_EXTS = sorted({e.lstrip(".") for e in (ct.IMAGE_EXTS | ct.VIDEO_EXTS | ct.VECTOR_EXTS | ct.FONT_EXTS)} | ARCHIVES)
@@ -31,7 +32,7 @@ BLANK_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADU
 def blueprint_screen(app, ctx: CardContext, bp_path: Path) -> Screen:
     view = BlueprintView(app, ctx, bp_path)
     return Screen(title="", build=lambda a: view.build(), bar=lambda a: card_bar(a, ctx, "blueprint"),
-                  on_leave=view.dispose, title_font=False)
+                  on_leave=view.dispose, title_font=False, sig=lambda a: ctx.bar_sig())
 
 
 def _clock(seconds: float) -> str:
@@ -49,6 +50,9 @@ class BlueprintView:
         self.busy = False
         self.anim_token = 0
         self.engine: Optional[live_synth.LiveSynth] = None
+        self._header: Optional[ft.Control] = None      # built once; reused across tab switches (no flicker)
+        self._header_key = None
+        self.icon_task: Optional[tasks.Task] = None
         self.reload()
         self.root = ft.Column([], spacing=0, scroll=ft.ScrollMode.AUTO, expand=True)
 
@@ -59,11 +63,17 @@ class BlueprintView:
         self.bp = ops.load_blueprint(self.bp_path)
         self.name = ops.blueprint_title(self.bp, self.bp_path.stem)
         self.bg = card_bg(self.card_dir)
+        st = self.bp_path.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if key != self._header_key:                    # blueprint changed on disk: header must be rebuilt
+            self._header_key, self._header = key, None
         return True
 
     def dispose(self):
         self.alive = False
         self.anim_token += 1
+        if self.icon_task:
+            self.icon_task.cancel()
         self._close_engine()
 
     def build(self) -> ft.Control:
@@ -87,17 +97,41 @@ class BlueprintView:
 
     # ── header / tabs ─────────────────────────────────────────────────────
     def header(self) -> ft.Control:
+        """Small 128px preview icon (from the local icon store) + the name, on the plain background."""
+        if self._header is not None:
+            return self._header
         d2 = drawing.get_drawing2(self.bp)
-        holder = ft.Container(width=76, height=76, bgcolor=self.bg, border_radius=10, border=ft.Border.all(1, SEP),
-                              alignment=ft.Alignment.CENTER)
+        holder = ft.Container(width=76, height=76, alignment=ft.Alignment.CENTER)
         if d2 and drawing.frame_count(d2):
-            holder.content = ft.Image(src=drawing.render_png(self.bp, 152, self.bg), width=72, height=72,
-                                      fit=ft.BoxFit.CONTAIN, gapless_playback=True)
+            png = self.app.icons.png(self.card_dir, self.bp_path)
+            if png:
+                holder.content = ft.Image(src=png, width=72, height=72, fit=ft.BoxFit.CONTAIN, gapless_playback=True)
+            else:
+                self._render_icon_later(holder)
         else:
             holder.content = castle_icon("brick", 28, MINOR1)
-        return ft.Container(ft.Row([
+        self._header = ft.Container(ft.Row([
             holder, text(self.name, 20, bold=True, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS, expand=True)],
             spacing=14, vertical_alignment=ft.CrossAxisAlignment.CENTER), padding=14)
+        return self._header
+
+    def _render_icon_later(self, holder: ft.Container):
+        task = tasks.Task("icon")
+        self.icon_task = task
+
+        def make():
+            try:
+                with tasks.use(task):
+                    return self.app.icons.render(self.card_dir, self.bp_path)
+            except tasks.Cancelled:
+                return None
+
+        async def go():
+            png = await asyncio.to_thread(make)
+            if png and not task.cancelled:
+                holder.content = ft.Image(src=png, width=72, height=72, fit=ft.BoxFit.CONTAIN, gapless_playback=True)
+                self.app.page.update()
+        self.app.page.run_task(go)
 
     def tabs(self) -> ft.Control:
         def tab(key: str, label: str, icon: str):
@@ -118,6 +152,8 @@ class BlueprintView:
                       spacing=0)
 
     def log_box(self) -> ft.Control:
+        if not self.app.dev_mode:                      # logs are a Developer-mode feature
+            return ft.Container(height=0)
         return ft.Container(ft.Column([minor("Activity", 11), self.app.log_view(110)], spacing=4),
                             margin=ft.Margin.only(top=14))
 
@@ -136,8 +172,7 @@ class BlueprintView:
         if d2 and drawing.frame_count(d2):
             out.append(self.preview_block(d2))
         else:
-            out.append(ft.Container(castle_icon("pencil", 30, MINOR1), height=140, bgcolor=self.bg, border_radius=12,
-                                    border=ft.Border.all(1, SEP), alignment=ft.Alignment.CENTER))
+            out.append(ft.Container(castle_icon("pencil", 30, MINOR1), height=140, alignment=ft.Alignment.CENTER))
         out.append(ft.Container(pill_button("Upload", self.on_pick_media, castle_icon("upload", 18, BG), filled=True),
                                 margin=ft.Margin.only(top=14)))
         out.append(self.log_box())
@@ -146,11 +181,9 @@ class BlueprintView:
     def preview_block(self, d2: dict) -> ft.Control:
         info = drawing.drawing_info(d2)
         n = info["frames"]
-        img = ft.Image(src=drawing.render_png(d2, 240, self.bg), width=240, height=240, fit=ft.BoxFit.CONTAIN,
+        img = ft.Image(src=drawing.render_png(d2, 240, None), width=240, height=240, fit=ft.BoxFit.CONTAIN,
                        gapless_playback=True)
-        controls: list[ft.Control] = [
-            ft.Container(img, bgcolor=self.bg, border_radius=12, border=ft.Border.all(1, SEP),
-                         alignment=ft.Alignment.CENTER, height=250)]
+        controls: list[ft.Control] = [ft.Container(img, alignment=ft.Alignment.CENTER, height=250)]
         if n > 1:
             slider = ft.Slider(min=1, max=n, divisions=n - 1, value=1, expand=True, active_color=MAJOR,
                                inactive_color=SEP, label="{value}")
@@ -179,7 +212,8 @@ class BlueprintView:
             play_btn.on_click = toggle
 
             async def run():
-                frames = await asyncio.to_thread(drawing.render_animation, d2, 240, self.bg)
+                frames = await asyncio.to_thread(drawing.render_animation, d2, 240, None, 240,
+                                                 lambda: token != self.anim_token)
                 if token != self.anim_token or not frames:
                     return
                 state["frames"] = frames
@@ -228,8 +262,7 @@ class BlueprintView:
                              f"{bpm:g} BPM", 12))
             out.append(self.player_controls(music, bpm))
         else:
-            out.append(ft.Container(castle_icon("music", 30, MINOR1), height=120, border_radius=12,
-                                    border=ft.Border.all(1, SEP), alignment=ft.Alignment.CENTER))
+            out.append(ft.Container(castle_icon("music", 30, MINOR1), height=120, alignment=ft.Alignment.CENTER))
         if ct.HAS_MIDO:
             out.append(ft.Container(pill_button("Upload", self.on_pick_midi, castle_icon("upload", 18, BG), filled=True,
                                                 busy=self.busy), margin=ft.Margin.only(top=14)))
@@ -248,10 +281,9 @@ class BlueprintView:
         self.engine = eng
         eng.loop = False
         dur_ms = max(1, int(eng.duration * 1000))
-        state = {"dragging": False, "icon": "play"}
+        state = {"dragging": False, "icon": "play_music"}
 
-        play_btn = icon_button(castle_icon("play", 26), None, size=44)
-        stop_btn = icon_button(castle_icon("stop", 22), None, size=40)
+        play_btn = icon_button(castle_icon("play_music", 26), None, size=44)
         slider = ft.Slider(min=0, max=dur_ms, value=0, expand=True, active_color=MAJOR, inactive_color=SEP)
         # fixed-width time slots: DM Sans digits aren't tabular, so the slider must not jiggle
         elapsed = ft.Container(text("0:00", 12, MINOR1, text_align=ft.TextAlign.RIGHT), width=40,
@@ -260,23 +292,18 @@ class BlueprintView:
                               alignment=ft.Alignment.CENTER_LEFT)
 
         def paint_icon():
-            icon = "pause" if eng.playing else "play"
+            icon = "stop" if eng.playing else "play_music"
             if icon != state["icon"]:
                 state["icon"] = icon
                 play_btn.content = castle_icon(icon, 26)
 
         def toggle(e):
             if eng.playing:
-                eng.pause()
+                eng.stop()                              # stop = back to the start
+                slider.value = 0
+                elapsed.content.value = "0:00"
             else:
                 eng.play()
-            paint_icon()
-            self.app.page.update()
-
-        def stop(e):
-            eng.stop()
-            slider.value = 0
-            elapsed.content.value = "0:00"
             paint_icon()
             self.app.page.update()
 
@@ -287,7 +314,7 @@ class BlueprintView:
             state["dragging"] = False
             eng.seek(float(e.control.value) / 1000)
 
-        play_btn.on_click, stop_btn.on_click = toggle, stop
+        play_btn.on_click = toggle
         slider.on_change_start, slider.on_change_end = drag_start, drag_end
         token = self.anim_token
 
@@ -305,20 +332,17 @@ class BlueprintView:
                 await asyncio.sleep(0.1)
 
         self.app.page.run_task(tick)
-        row = ft.Row([play_btn, stop_btn, elapsed, slider, length], spacing=2,
-                     vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        row = ft.Row([play_btn, elapsed, slider, length], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER)
         if eng.warnings:
-            row.controls.append(info_button(self.app, "\n".join(eng.warnings), "Preview"))
+            return ft.Column([row, info_note("\n".join(eng.warnings))], spacing=6)
         return row
 
     async def on_pick_midi(self, e):
         path = await self.app.pick(["mid", "midi"], "Choose a MIDI file")
         if not path:
             return
-        self.busy = True
-        self.render()
-        res = await self.ctx.edit_async(lambda: ops.import_midi(self.bp_path, self.card_dir, path,
-                                                                log=self.app.log))
+        res = await self.ctx.edit_async("Importing MIDI", lambda task: ops.import_midi(
+            self.bp_path, self.card_dir, path, log=self.app.log, task=task))
         await self.after_edit(res, "MIDI imported.")
 
     # ── AUDIO ─────────────────────────────────────────────────────────────
@@ -333,13 +357,10 @@ class BlueprintView:
                     padding=ft.Padding.symmetric(vertical=6, horizontal=10), border_radius=8,
                     border=ft.Border.all(1, SEP)))
         else:
-            out.append(ft.Container(castle_icon("unmuted", 30, MINOR1), height=120, border_radius=12,
-                                    border=ft.Border.all(1, SEP), alignment=ft.Alignment.CENTER))
-        out.append(ft.Container(ft.Row([
-            pill_button("Upload", self.on_pick_audio, castle_icon("upload", 18, BG), filled=True, busy=self.busy),
-            info_button(self.app, "Sounds longer than 30 seconds are split into parts that play back to back. "
-                                  "Only .mp3 files can be added on devices that can't encode MP3.", "Audio"),
-        ], spacing=6), margin=ft.Margin.only(top=14)))
+            out.append(ft.Container(castle_icon("unmuted", 30, MINOR1), height=120, alignment=ft.Alignment.CENTER))
+        out.append(ft.Container(pill_button("Upload", self.on_pick_audio, castle_icon("upload", 18, BG), filled=True,
+                                            busy=self.busy), margin=ft.Margin.only(top=14)))
+        out.append(info_note("Audio is split into 30 second segments"))
         out.append(self.log_box())
         return ft.Column(out, spacing=8)
 
@@ -350,10 +371,8 @@ class BlueprintView:
         if not path:
             return
         token = self.app.api.token
-        self.busy = True
-        self.render()
-        res = await self.ctx.edit_async(
-            lambda: ops.import_audio(self.bp_path, self.card_dir, path, log=self.app.log, token=token))
+        res = await self.ctx.edit_async("Uploading audio", lambda task: ops.import_audio(
+            self.bp_path, self.card_dir, path, log=self.app.log, token=token, task=task))
         await self.after_edit(res, "Audio added." if not res or len(res) == 1 else f"Added {len(res)} actors.")
 
 
@@ -368,15 +387,54 @@ class ImportDialog:
         self.vals: dict = {"charsets": {"ASCII"}, "quantize_on": info["size"] > 500_000}
         self.busy = False
         self.token = 0
+        self.frame = 0                       # which frame the preview shows (0-based)
+        self.pv_task: Optional[tasks.Task] = None
+        self.holder: dict = {}
         self.preview_img = ft.Image(width=200, height=200, fit=ft.BoxFit.CONTAIN, gapless_playback=True, src=BLANK_PNG)
-        self.preview_box = ft.Container(self.preview_img, width=220, height=220, bgcolor=view.bg, border_radius=12,
-                                        border=ft.Border.all(1, SEP), alignment=ft.Alignment.CENTER, opacity=0.4)
+        self.preview_box = ft.Container(self.preview_img, width=220, height=220,
+                                        alignment=ft.Alignment.CENTER, opacity=0.4)   # plain: no card behind it
+        self.frame_label = minor("", 12, width=64, text_align=ft.TextAlign.RIGHT)
+        self.frame_slider = ft.Slider(min=1, max=2, divisions=1, value=1, expand=True, active_color=MAJOR,
+                                      inactive_color=SEP, on_change=self._frame_drag, on_change_end=self._frame_set)
+        self.frame_row = ft.Row([self.frame_slider, self.frame_label], visible=False,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER)
         self.options = ft.Column([], spacing=10)
         self.import_host = ft.Container()
+
+    # preview frame picker -------------------------------------------------
+    def frame_total(self) -> int:
+        v = self.vals
+        try:
+            every = max(1, int(float(v.get("every", 1) or 1)))
+        except ValueError:
+            every = 1
+        if self.cat in ("font", "audio"):
+            return 1
+        return ops.preview_frame_count(self.info, {"every": every, "layout": v.get("layout", "frames")})
+
+    def sync_frame_row(self):
+        n = self.frame_total()
+        self.frame = min(self.frame, n - 1)
+        self.frame_row.visible = n > 1
+        if n > 1:
+            self.frame_slider.max = n
+            self.frame_slider.divisions = n - 1
+            self.frame_slider.value = self.frame + 1
+            self.frame_label.value = f"{self.frame + 1} / {n}"
+
+    def _frame_drag(self, e):
+        self.frame_label.value = f"{int(e.control.value)} / {self.frame_total()}"
+        self.app.page.update()
+
+    def _frame_set(self, e):
+        self.frame = int(e.control.value) - 1
+        self.schedule_preview()
 
     # widgets -------------------------------------------------------------
     def set(self, key: str, value):
         self.vals[key] = value
+        if key == "every":
+            self.sync_frame_row()
         self.schedule_preview()
 
     def num(self, key: str, label: str, default, **kw) -> ft.Control:
@@ -424,11 +482,11 @@ class ImportDialog:
         if cat in ("animation", "video"):
             c.append(self.num("every", "Every Nth frame", 1, step=1, minimum=1))
         if multi and cat in ("image", "vector"):
-            c.append(ft.Row([self.choice("layout", "Several files", [("frames", "Frames of one actor"),
-                                                                     ("separate", "Separate actors")], "frames"),
-                             info_button(self.app, "Frames of one actor: every file becomes a frame of this blueprint. "
-                                                   "Separate actors: every file becomes its own blueprint.", "Several files")],
-                            spacing=4))
+            c.append(self.choice("layout", "Several files", [("frames", "Frames of one actor"),
+                                                             ("separate", "Separate actors")], "frames"))
+            c.append(info_note("Every file becomes a frame of this blueprint." if
+                               self.vals.get("layout", "frames") == "frames" else
+                               "Every file becomes its own blueprint."))
             if self.vals.get("layout", "frames") == "frames":
                 c.append(self.num("fps", "Frames per second", 4, step=1, minimum=1, maximum=60, decimals=1))
             if bitmap_like and cat == "image":
@@ -471,6 +529,7 @@ class ImportDialog:
 
     def rebuild(self):
         self.options.controls = self.option_controls()
+        self.sync_frame_row()
         self.app.page.update()
 
     # options → ops arguments ---------------------------------------------
@@ -504,8 +563,13 @@ class ImportDialog:
         }
 
     # preview -------------------------------------------------------------
+    def cancel_preview(self):
+        if self.pv_task:
+            self.pv_task.cancel()
+
     def schedule_preview(self):
         self.token += 1
+        self.cancel_preview()                           # a newer setting makes the running render pointless
         self.app.page.run_task(self._preview, self.token)
 
     async def _preview(self, token: int):
@@ -518,35 +582,42 @@ class ImportDialog:
             return
         self.preview_box.opacity = 0.4
         self.app.page.update()
-        fn = ops.preview_font if kind == "font" else ops.preview_media
-        try:
-            png = await asyncio.to_thread(lambda: fn(self.path, opts, log=lambda m: None, bg=self.view.bg))
-        except Exception:
-            png = None
-        if token != self.token:
+        task = tasks.Task("preview")
+        self.pv_task = task
+        frame = self.frame
+
+        def job():
+            try:
+                if kind == "font":
+                    return ops.preview_font(self.path, opts, log=lambda m: None, bg=None, task=task)
+                return ops.preview_media(self.path, opts, log=lambda m: None, bg=None, task=task, frame=frame)
+            except Exception as ex:
+                self.app.log(f"preview: {ex}", 2)
+                return None
+
+        png = await self.app.run(job, report=False)
+        if token != self.token or task.cancelled:
             return
         if png:
             self.preview_img.src = png
             self.preview_box.opacity = 1.0
         self.app.page.update()
 
+    def on_closed(self):
+        """Dialog gone (✕, tap outside, or after a finished import): stop anything still running."""
+        self.token += 1
+        self.cancel_preview()
+
     # run ------------------------------------------------------------------
     def open(self):
         self.options.controls = self.option_controls()
-        self.paint_import()
-        body = ft.Column([ft.Container(self.preview_box, alignment=ft.Alignment.CENTER), self.options],
-                         spacing=14, scroll=ft.ScrollMode.AUTO, width=300, height=520)
-        self.app.dialog("Upload", body, [
-            ft.TextButton(content=text("Cancel", 14, MINOR1), on_click=self.cancel),
-            ft.Container(self.import_host, padding=ft.Padding(right=8))])
+        self.sync_frame_row()
+        content = ft.Column([ft.Container(self.preview_box, alignment=ft.Alignment.CENTER), self.frame_row,
+                             self.options], spacing=14, scroll=ft.ScrollMode.AUTO, width=300, height=520)
+        self.holder["dlg"] = self.app.dialog("Upload", content, [
+            ft.Container(pill_button("Import", self.do_import, filled=True), padding=ft.Padding(right=8))],
+            on_close=self.on_closed)
         self.schedule_preview()
-
-    def paint_import(self):
-        self.import_host.content = pill_button("Import", self.do_import, filled=True, busy=self.busy)
-
-    def cancel(self, e):
-        self.token += 1
-        self.app.page.pop_dialog()
 
     async def do_import(self, e):
         if self.busy:
@@ -558,18 +629,16 @@ class ImportDialog:
             return
         v, path, token = self.view, self.path, self.app.api.token
         self.busy = True
-        self.paint_import()
-        self.app.page.update()
+        self.token += 1
+        self.cancel_preview()                           # free the converter before the real import
         if kind == "font":
-            fn = lambda: ops.import_font(v.bp_path, v.card_dir, path, opts, log=self.app.log, token=token)
+            fn = lambda task: ops.import_font(v.bp_path, v.card_dir, path, opts, log=self.app.log, token=token, task=task)
         else:
-            fn = lambda: ops.import_media(v.bp_path, v.card_dir, path, opts, log=self.app.log, token=token)
-        res = await v.ctx.edit_async(fn)
+            fn = lambda task: ops.import_media(v.bp_path, v.card_dir, path, opts, log=self.app.log, token=token, task=task)
+        res = await v.ctx.edit_async("Importing", fn)
         self.busy = False
         if res:
-            self.token += 1
-            self.app.page.pop_dialog()
+            self.app.close_dialog(self.holder["dlg"])
             await v.after_edit(res, "Imported." if len(res) == 1 else f"Imported {len(res)} actors.")
         else:
-            self.paint_import()
-            self.app.page.update()
+            self.schedule_preview()                     # cancelled or failed: dialog stays, settings kept

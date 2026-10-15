@@ -10,6 +10,7 @@ tmp = Path(tempfile.mkdtemp()); os.environ["FLET_APP_STORAGE_DATA"] = str(tmp)
 tasks = []
 class Page:
     platform = ft.PagePlatform.WINDOWS
+    height = 800
     def __init__(self): self.dialogs = []
     def update(self, *a): pass
     def add(self, *c): pass
@@ -92,7 +93,7 @@ home.left(app); home.actions(app); lib.clone_dialog(app)
 ds = lib.deck_screen(app, d); ds.build(app); assert ds.title == "Deck"
 cs = lib.card_screen(app, d, "card1"); app.push(ds); app.push(cs); drain()
 ctx = cardbar.CardContext(app, d, "card1")
-for mode in ("card", "blueprint", "player"): cardbar.card_bar(app, ctx, mode)
+for mode in ("card", "blueprint"): cardbar.card_bar(app, ctx, mode)
 assert not ctx.session.dirty
 
 # ---- edit → dirty → undo/redo → discard; save marks clean
@@ -105,7 +106,7 @@ appmod.push_card = lambda api, deck_dir, card_id, log: saved.append(card_id)
 app.api = type("A", (), {"token": "tok"})(); app.online = True
 assert asyncio.run(app.save_card(ctx)) and saved == ["card1"] and not ctx.session.dirty and not S.deck_has_unsaved(d)
 ctx.edit_sync(lambda: ops.set_card_background(ctx.card_dir, "#00aa00")); assert ctx.session.dirty
-asyncio.run(cardbar.leave_card(app, ctx)); assert isinstance(page.dialogs[-1], ft.AlertDialog) and page.dialogs[-1].title.value == "Save Changes?"
+asyncio.run(cardbar.leave_card(app, ctx)); assert isinstance(page.dialogs[-1], ft.AlertDialog) and page.dialogs[-1].title.controls[-1].value == "Save Changes?"
 page.dialogs.pop(); ctx.session.discard(); assert lib.card_bg(c) == "#aa0000" and not ctx.session.dirty
 cardbar.card_settings_dialog(app, ctx)
 

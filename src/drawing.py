@@ -211,13 +211,19 @@ def render_png(bp_or_d2: dict, size: int = 128, bg=None, frame: Optional[int] = 
     return to_png(render_frame(d2, idx, size, bg))
 
 
-def render_animation(d2: dict, size: int = 256, bg=None, max_frames: int = 240) -> list[bytes]:
-    """All frames (capped), framed identically using the union bounds."""
+def render_animation(d2: dict, size: int = 256, bg=None, max_frames: int = 240, cancel=None) -> list[bytes]:
+    """All frames (capped), framed identically using the union bounds. `cancel` is polled
+    between frames: when it returns True the job stops and returns []."""
     n = min(frame_count(d2), max_frames)
     if n == 0:
         return []
     bounds = _scene_bounds(d2, range(n))
-    return [to_png(render_frame(d2, i, size, bg, bounds=bounds)) for i in range(n)]
+    out = []
+    for i in range(n):
+        if cancel and cancel():
+            return []
+        out.append(to_png(render_frame(d2, i, size, bg, bounds=bounds)))
+    return out
 
 
 def b64(png: bytes) -> str:

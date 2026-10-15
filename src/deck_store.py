@@ -29,6 +29,7 @@ import shutil
 from pathlib import Path
 from typing import Callable, Optional
 
+import tasks
 from castle_api import CastleAPI, CastleAPIError, UNLISTED_TEST_CONTENT_FLAGS
 
 Log = Callable[[str], None]
@@ -179,9 +180,10 @@ def clone_deck(api: CastleAPI, deck_id: str, root: Path, log: Log = print) -> Pa
         "cards": cards,
     })
 
-    for card in cards:
+    for ci, card in enumerate(cards):
         if not card.get("cardId") or not card.get("sceneDataUrl"):
             continue
+        tasks.step(ci, len(cards), f"Downloading card {ci + 1}/{len(cards)}")
         log(f"getting {card['cardId']}...")
         scene_data = api.download_scene_data(card["sceneDataUrl"])
         _write_card(deck_dir / "cards" / card["cardId"], card, scene_data)
@@ -353,7 +355,11 @@ def push_card(api: CastleAPI, deck_dir: Path, card_id: str, log: Log = print) ->
     card_json["title"] = card.get("title") or card_json.get("title") or f"Card {index + 1}"
     _write_json(card_json_path, card_json)
 
-    upload_id = api.upload_scene_data(card_id, materialize_card(card_dir))
+    tasks.say("Preparing card", 0.1)
+    scene = materialize_card(card_dir)
+    tasks.say("Uploading card", 0.3)
+    upload_id = api.upload_scene_data(card_id, scene)
+    tasks.say("Updating deck", 0.85)             # last point where Cancel still applies
     deck_input = {
         "deckId": deck["deckId"],
         "title": deck.get("title") or deck_dir.name,

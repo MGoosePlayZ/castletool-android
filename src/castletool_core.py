@@ -52,6 +52,17 @@ except ImportError:
 
 HAS_FFMPEG = shutil.which("ffmpeg") is not None
 
+# Cancel / progress hooks. The Android app supplies tasks.py; as a plain CLI these are no-ops.
+try:
+    from tasks import check as check_cancel, step as report_step, say as report_say, span as report_span
+except ImportError:  # pragma: no cover
+    from contextlib import nullcontext as _nullcontext
+
+    def check_cancel(): pass
+    def report_step(done, total, message=None): pass
+    def report_say(message, frac=None): pass
+    def report_span(start, end): return _nullcontext()
+
 # pillow-heif is optional (HEIC/HEIF); installed on first use by ensure_heif().
 HAS_HEIF = False
 try:
@@ -556,9 +567,12 @@ def load_image_frames(path: Path, width: int, height: int, ico_size=None,
     # Animated GIF/WEBP
     frames = []
     durations = []
+    total = getattr(img, "n_frames", 0) or 0
 
     try:
         while True:
+            report_step(len(frames), total, f"Processing frame {len(frames) + 1}/{total}" if total else
+                        f"Processing frame {len(frames) + 1}")
             frame = img.convert("RGBA").resize((width, height), resample)
             buf = io.BytesIO()
             frame.save(buf, format="PNG")
@@ -879,6 +893,15 @@ def add_or_replace_audio_rule(actor: dict, upload_urls):
             break
     else:
         rules_component["rules"].append(replacement)
+
+
+def quantize_frames(frames: list, colors: int) -> list:
+    """quantize_frame over a list, with cancel checks and progress."""
+    out, n = [], len(frames)
+    for i, f in enumerate(frames):
+        report_step(i, n, f"Reducing colors {i + 1}/{n}")
+        out.append(quantize_frame(f, colors))
+    return out
 
 
 def quantize_frame(png_bytes: bytes, colors: int) -> bytes:
@@ -1806,7 +1829,8 @@ def collect_midi_tracks(mid) -> list[dict]:
     tpb = mid.ticks_per_beat
     scale = make_tick_scaler(get_tempo_map(mid))
     result = []
-    for track in mid.tracks:
+    for ti, track in enumerate(mid.tracks):
+        report_step(ti, len(mid.tracks), f"Reading track {ti + 1}/{len(mid.tracks)}")
         events, abs_tick = [], 0
         programs = {}       # channel -> most recently seen program
         usage = Counter()   # (channel, program) -> note_on count
@@ -1868,9 +1892,12 @@ def gm_program_to_tone(program: int, is_drum: bool) -> tuple[str, float, float]:
     return "sawtooth", 0.0, 0.4  # unreachable, GM_FAMILIES covers 0-127
 
 def build_music(mid, beats_per_bar: int = 4) -> dict:
-    midi_tracks = collect_midi_tracks(mid)
+    with report_span(0.0, 0.3):
+        midi_tracks = collect_midi_tracks(mid)
     patterns, castle_tracks = {}, []
     for t_idx, track in enumerate(midi_tracks):
+        with report_span(0.3, 1.0):
+            report_step(t_idx, len(midi_tracks), f"Converting track {t_idx + 1}/{len(midi_tracks)}")
         waveform, attack, release = gm_program_to_tone(track["program"], track["is_drum"])
 
         # merge every note in the track into a single pattern, keyed by
@@ -2273,11 +2300,15 @@ def attach_audio(actor: dict, src: Path, is_video: bool) -> bool:
     tmp_dir = Path(tempfile.mkdtemp(prefix="castletool-audio-"))
     try:
         pb("Extracting audio..." if is_video else f"Converting {src.name}...")
-        parts = split_audio_mp3(src, tmp_dir, is_video)
+        report_say("Extracting audio" if is_video else f"Converting {src.name}", 0.0)
+        with report_span(0.0, 0.5):
+            parts = split_audio_mp3(src, tmp_dir, is_video)
         urls = []
         for i, part in enumerate(parts, 1):
             label = f" (part {i}/{len(parts)})" if len(parts) > 1 else ""
             pb(f"Uploading audio to Castle{label}...")
+            with report_span(0.5, 1.0):
+                report_step(i - 1, len(parts), f"Uploading segment {i}/{len(parts)}")
             urls.append(upload_audio_file(part)["url"])
         add_or_replace_audio_rule(actor, urls)
         if len(urls) > 1:
@@ -2447,7 +2478,7 @@ def render_visual(path: Path, cat: str, st: dict, ico_size=None):
         frames = [png]
         if st["quantize"]:
             pb(f"Quantizing to {st['quantize']} colors...")
-            frames = [quantize_frame(f, st["quantize"]) for f in frames]
+            frames = quantize_frames(frames, st["quantize"])
         drawing2 = build_drawing2(frames, 1.0, width, height, "still",
                                   scale=st["fixed_scale"])
         return drawing2, f"SVG ready: bitmap, {width}×{height}px"
@@ -2462,18 +2493,21 @@ def render_visual(path: Path, cat: str, st: dict, ico_size=None):
 
     width, height = scaled_size(visual_native_size(path, cat, ico_size), st["scale"])
     pb(f"Loading {'video' if cat == 'video' else 'image'}: {path.name}")
-    if cat == "video":
-        frames, fps = extract_mp4_frames(path, width, height, every_n=st["every"],
-                                         smooth=st["smooth"])
-    else:
-        frames, fps = load_image_frames(path, width, height, ico_size=ico_size,
-                                        smooth=st["smooth"])
-        if st["every"] > 1:
-            frames = frames[::st["every"]]
-            fps = fps / st["every"]
+    load_end = 0.8 if st["quantize"] else 1.0
+    with report_span(0.0, load_end):
+        if cat == "video":
+            frames, fps = extract_mp4_frames(path, width, height, every_n=st["every"],
+                                             smooth=st["smooth"])
+        else:
+            frames, fps = load_image_frames(path, width, height, ico_size=ico_size,
+                                            smooth=st["smooth"])
+            if st["every"] > 1:
+                frames = frames[::st["every"]]
+                fps = fps / st["every"]
     if st["quantize"]:
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
-        frames = [quantize_frame(f, st["quantize"]) for f in frames]
+        with report_span(load_end, 1.0):
+            frames = quantize_frames(frames, st["quantize"])
     play_mode = "loop" if (cat in ("animation", "video") or len(frames) > 1) else "still"
     drawing2 = build_drawing2(frames, fps, width, height, play_mode,
                               scale=st["fixed_scale"])
@@ -2487,8 +2521,11 @@ def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float
     frames: list[bytes] = []
     sizes: list[tuple[int, int]] = []
 
+    load_end = 0.85 if st["quantize"] else 1.0
     if st["no_scale"]:
-        for f in files:
+        for fi, f in enumerate(files):
+            with report_span(0.0, load_end):
+                report_step(fi, len(files), f"Processing image {fi + 1}/{len(files)}")
             pb(f"Loading image: {f.name}")
             try:
                 w, h = visual_native_size(f, "image", ico_sizes.get(f))
@@ -2503,7 +2540,9 @@ def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float
         width, height = max(s[0] for s in sizes), max(s[1] for s in sizes)
     else:
         width = height = None
-        for f in files:
+        for fi, f in enumerate(files):
+            with report_span(0.0, load_end):
+                report_step(fi, len(files), f"Processing image {fi + 1}/{len(files)}")
             pb(f"Loading image: {f.name}")
             try:
                 if width is None:   # sized like the first image that loads
@@ -2521,7 +2560,8 @@ def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float
 
     if st["quantize"]:
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
-        frames = [quantize_frame(f, st["quantize"]) for f in frames]
+        with report_span(load_end, 1.0):
+            frames = quantize_frames(frames, st["quantize"])
     play_mode = "loop" if len(frames) > 1 else "still"
     drawing2 = build_drawing2(frames, fps, width, height, play_mode,
                               sizes=sizes, scale=st["fixed_scale"])
@@ -2535,7 +2575,8 @@ def render_svg_frames_actor(files: list[Path], st: dict, fps: float):
     as still images."""
     if not st["bitmap"]:
         items = []
-        for f in files:
+        for fi, f in enumerate(files):
+            report_step(fi, len(files), f"Processing SVG {fi + 1}/{len(files)}")
             pb(f"Loading SVG: {f.name}")
             try:
                 items.append(svg_to_path_data(f, steps=st["steps"], scale=st["svg_scale"],
@@ -2549,7 +2590,8 @@ def render_svg_frames_actor(files: list[Path], st: dict, fps: float):
         return drawing2, f"SVG ready: {len(items)} frame(s), {fps} FPS"
 
     rendered = []   # (png, w, h)
-    for f in files:
+    for fi, f in enumerate(files):
+        report_step(fi, len(files), f"Processing SVG {fi + 1}/{len(files)}")
         pb(f"Rasterizing SVG: {f.name}")
         try:
             rendered.append(rasterize_svg(f, scale=st["scale"], smooth=st["smooth"],
@@ -2576,7 +2618,7 @@ def render_svg_frames_actor(files: list[Path], st: dict, fps: float):
         sizes = None
     if st["quantize"]:
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
-        frames = [quantize_frame(f, st["quantize"]) for f in frames]
+        frames = quantize_frames(frames, st["quantize"])
     play_mode = "loop" if len(frames) > 1 else "still"
     drawing2 = build_drawing2(frames, fps, width, height, play_mode,
                               sizes=sizes, scale=st["fixed_scale"])
@@ -2855,7 +2897,8 @@ def render_font_bitmap(fp: Path, font, codepoints: list[int], px: int,
     rgb = tuple(round(c * 255) for c in color[:3])
     alpha = color[3] if len(color) > 3 else 1.0
     frames = []
-    for cp in present:
+    for gi, cp in enumerate(present):
+        report_step(gi, len(present), f"Rendering glyph {gi + 1}/{len(present)}")
         mask = Image.new("L", (width, height), 0)
         draw = ImageDraw.Draw(mask)
         draw.fontmode = "L" if smooth else "1"

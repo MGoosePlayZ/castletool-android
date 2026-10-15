@@ -121,6 +121,16 @@ class CardSession:
         if self.undo_stack:
             self.undo_stack.pop()
 
+    def rollback(self) -> None:
+        """A change failed or was cancelled part-way: put the files back as they were at the
+        last checkpoint (only touching them if something was actually written)."""
+        if not self.undo_stack:
+            return
+        snap = _unpack(self.undo_stack.pop())
+        if digest(snapshot(self.dir)) != digest(snap):
+            restore(self.dir, snap)
+        self.refresh_dirty()
+
     def undo(self) -> bool:
         if not self.undo_stack:
             return False
