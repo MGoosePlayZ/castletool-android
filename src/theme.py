@@ -152,7 +152,7 @@ def popup_shape(radius: float = 14) -> ft.RoundedRectangleBorder:
 
 # ── extras ───────────────────────────────────────────────────────────────
 DANGER = "#F87171"       # discard / destructive text
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 CASTLE_LINKS = [
     ("Colophon", "https://castle.xyz/colophon"),
     ("Terms", "https://castle.xyz/terms"),

@@ -27,7 +27,7 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.6.0"
+CURRENT_VERSION = "0.7.0"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -1818,44 +1818,97 @@ def make_tick_scaler(tempo_map: list[tuple[int, int]]):
 
 def collect_midi_tracks(mid) -> list[dict]:
     """
-    Returns one entry per non-empty MIDI track:
+    Returns one entry per non-empty (track, kind) pair:
     {"events": [(beat, note, velocity), ...], "program": int, "is_drum": bool}
 
-    Since a Castle track only has one instrument, each MIDI track is
-    reduced to a single representative (channel, program) pair: whichever
-    combination its note_on events use most. Channel 10 (index 9) is
-    GM's reserved percussion channel regardless of its program number.
+    Channel 10 (index 9) is GM's reserved percussion channel regardless of
+    its program number, and its "notes" are drum-kit pieces rather than
+    pitches, so a MIDI track's percussion is split off into its own entry
+    (is_drum=True, raw GM note numbers; see `GM_DRUM_TO_CASTLE`). Everything
+    else in the track is reduced to a single representative (channel,
+    program) pair, since a Castle track only has one instrument: whichever
+    combination its pitched note_on events use most.
     """
     tpb = mid.ticks_per_beat
     scale = make_tick_scaler(get_tempo_map(mid))
     result = []
-    for ti, track in enumerate(mid.tracks):
-        report_step(ti, len(mid.tracks), f"Reading track {ti + 1}/{len(mid.tracks)}")
-        events, abs_tick = [], 0
+    for track in mid.tracks:
+        events, drum_events, abs_tick = [], [], 0
         programs = {}       # channel -> most recently seen program
-        usage = Counter()   # (channel, program) -> note_on count
+        usage = Counter()   # (channel, program) -> pitched note_on count
         for msg in track:
             abs_tick += msg.time
             if msg.type == "program_change":
                 programs[msg.channel] = msg.program
             elif msg.type == "note_on" and msg.velocity > 0:
-                events.append((scale(abs_tick) / tpb * 4, msg.note, msg.velocity))
-                channel = msg.channel
-                usage[(channel, programs.get(channel, 0))] += 1
-        if not events:
-            continue
-        (channel, program), _ = usage.most_common(1)[0]
-        result.append({
-            "events": events,
-            "program": program,
-            "is_drum": channel == 9,
-        })
+                ev = (scale(abs_tick) / tpb * 4, msg.note, msg.velocity)
+                if msg.channel == 9:
+                    drum_events.append(ev)
+                else:
+                    events.append(ev)
+                    usage[(msg.channel, programs.get(msg.channel, 0))] += 1
+        if events:
+            (_channel, program), _ = usage.most_common(1)[0]
+            result.append({"events": events, "program": program, "is_drum": False})
+        if drum_events:
+            result.append({"events": drum_events, "program": 0, "is_drum": True})
     return result
 
 def get_bpm(mid) -> float:
     """BPM implied by the MIDI file's initial (reference) tempo."""
     tempo_us = get_tempo_map(mid)[0][1]
     return 60_000_000 / tempo_us
+
+# ── GM percussion → Castle drums ─────────────────────────────────────────────
+# Castle's "drums" instrument has 7 pieces on consecutive keys 36-42. GM's
+# percussion map (channel 10, notes 35-81) has far more, so each GM piece is
+# folded onto the closest Castle piece; GM pieces with no sensible match
+# (cowbell, triangle, woodblocks, ...) are dropped.
+CASTLE_DRUM_KEYS = {
+    "kick": 36, "low_tom": 37, "high_tom": 38, "snare": 39,
+    "clap": 40, "closed_hat": 41, "open_hat": 42,
+}
+GM_DRUM_TO_CASTLE = {
+    35: 36, 36: 36,                    # Acoustic / Electric Bass Drum   -> Kick
+    37: 39, 38: 39, 40: 39,            # Side Stick, Acoustic/Electric Snare -> Snare
+    39: 40,                            # Hand Clap                       -> Clap
+    41: 37, 43: 37, 45: 37,            # Low/High Floor Tom, Low Tom     -> Low Tom
+    47: 38, 48: 38, 50: 38,            # Low-Mid, Hi-Mid, High Tom       -> High Tom
+    42: 41, 44: 41,                    # Closed / Pedal Hi-Hat           -> Hat
+    46: 42,                            # Open Hi-Hat                     -> Open Hat
+    49: 42, 52: 42, 55: 42, 57: 42,    # Crash 1/2, Chinese, Splash      -> Open Hat
+    51: 41, 59: 41, 53: 42,            # Ride 1/2 -> Hat, Ride Bell      -> Open Hat
+    54: 41, 69: 41, 70: 41,            # Tambourine, Cabasa, Maracas     -> Hat
+    60: 38, 61: 38,                    # Hi/Low Bongo                    -> High Tom
+    62: 38, 63: 38, 64: 37,            # Mute/Open Hi Conga, Low Conga   -> High/Low Tom
+}
+
+def drum_instrument() -> dict:
+    """A Castle "drums" instrument with Castle's default kit settings."""
+    return {
+        "type": "drums",
+        "props": {"name": "drums", "muted": False, "volume": 1},
+        "params": {
+            "useKick": True,
+            "kick": {"decay": 0.3, "punch": 0.89999, "freq": 80, "sweep": 0.6},
+            "useClosedHat": True,
+            "closedHat": {"decay": 0.1, "freq": 0.89999, "body": 0.1},
+            "useOpenHat": True,
+            "openHat": {"decay": 0.1, "freq": 0.89999, "body": 0.1},
+            "useSnare": True,
+            "snare": {"decay": 0.2, "freq": 0.5, "tambre": 0.5},
+            "useClap": True,
+            "clap": {"decay": 0.3, "freq": 0.5},
+            "useHiTom": True,
+            "hiTom": {"decay": 0.2, "freq": 0.75},
+            "useLoTom": True,
+            "loTom": {"decay": 0.2, "freq": 0.75},
+        },
+    }
+
+def gm_drum_to_castle(note: int):
+    """Castle drum key (36-42) for a GM percussion note, or None if unmapped."""
+    return GM_DRUM_TO_CASTLE.get(note)
 
 # GM instrument families, in program-number order (0-indexed, inclusive
 # upper bound), each mapped to one of Castle's 4 tone waveforms plus an
@@ -1891,6 +1944,36 @@ def gm_program_to_tone(program: int, is_drum: bool) -> tuple[str, float, float]:
             return waveform, attack, release
     return "sawtooth", 0.0, 0.4  # unreachable, GM_FAMILIES covers 0-127
 
+def _build_drum_track(track: dict, t_idx: int, patterns: dict):
+    """
+    Turn a GM percussion entry from `collect_midi_tracks` into a Castle
+    "drums" track. Registers its pattern in `patterns`; returns the track,
+    or None if none of its notes map to a Castle drum piece. Castle's drum
+    notes are just {"key"} (36 kick .. 42 open hat); velocity is not stored.
+    """
+    notes_by_beat = {}
+    for beat, note, _velocity in track["events"]:
+        key = gm_drum_to_castle(note)
+        if key is None:
+            continue
+        keys = notes_by_beat.setdefault(round(beat, 9), [])
+        if key not in keys:
+            keys.append(key)
+    if not notes_by_beat:
+        return None
+    pid = str(uuid.uuid4())
+    patterns[pid] = {
+        "patternId": pid,
+        "name": f"t{t_idx}",
+        "color": make_color(), "loop": "nextBar", "loopLength": 0,
+        "notes": {beat_key(b): [{"key": k} for k in sorted(ks)]
+                  for b, ks in sorted(notes_by_beat.items())},
+    }
+    return {
+        "instrument": drum_instrument(),
+        "sequence": {beat_key(0): {"patternId": pid, "loop": False}},
+    }
+
 def build_music(mid, beats_per_bar: int = 4) -> dict:
     with report_span(0.0, 0.3):
         midi_tracks = collect_midi_tracks(mid)
@@ -1898,7 +1981,13 @@ def build_music(mid, beats_per_bar: int = 4) -> dict:
     for t_idx, track in enumerate(midi_tracks):
         with report_span(0.3, 1.0):
             report_step(t_idx, len(midi_tracks), f"Converting track {t_idx + 1}/{len(midi_tracks)}")
-        waveform, attack, release = gm_program_to_tone(track["program"], track["is_drum"])
+
+        if track["is_drum"]:
+            drum_track = _build_drum_track(track, t_idx, patterns)
+            if drum_track is not None:
+                castle_tracks.append(drum_track)
+            continue
+        waveform, attack, release = gm_program_to_tone(track["program"], False)
 
         # merge every note in the track into a single pattern, keyed by
         # its absolute beat position (instead of one pattern per bar).

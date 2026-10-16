@@ -9,6 +9,10 @@ Model (what castletool writes and Castle's "tone" sampler does):
   * Castle's note `key` sounds one octave below the same MIDI number, which is
     why castletool adds 12 on import - so MIDI pitch = key - 12.
 A tone has no sustain: it ramps up over `attack`, then dies away over `release`.
+
+Drums: song.tracks[].instrument = {type:"drums", params:{kick, snare, ...}}; notes
+use keys 36-42 (kick, low tom, high tom, snare, clap, hat, open hat) and have no
+pitch, so each key renders its own little synthesized hit instead of a tone.
 """
 from __future__ import annotations
 
@@ -50,6 +54,74 @@ def _envelope(n: int, attack: float, release: float, sr: int) -> np.ndarray:
     rn = max(1, n - r0)
     env[r0:] = (1 - np.arange(rn) / rn) ** 2   # fast-then-slow decay
     return env
+
+
+# Castle drum keys -> (params group, use-flag) in instrument.params
+DRUM_KEYS = {
+    36: ("kick", "useKick"), 37: ("loTom", "useLoTom"), 38: ("hiTom", "useHiTom"),
+    39: ("snare", "useSnare"), 40: ("clap", "useClap"),
+    41: ("closedHat", "useClosedHat"), 42: ("openHat", "useOpenHat"),
+}
+DRUM_GAIN = 0.7
+
+
+def _exp_env(n: int, decay: float, sr: int) -> np.ndarray:
+    return np.exp(-np.arange(n) / (max(0.005, decay) * sr / 5.0))
+
+
+def _hat(p: dict, n: int, rng, sr: int) -> np.ndarray:
+    noise = rng.uniform(-1, 1, n + 1)
+    hiss = np.diff(noise)                                   # crude high-pass
+    f = 3000.0 + float(p.get("freq", 0.9)) * 5000.0
+    t = np.arange(n) / sr
+    metal = sum(np.sign(np.sin(2 * math.pi * f * r * t)) for r in (1.0, 1.4, 1.71)) / 3.0
+    return (hiss * 0.5 + metal * float(p.get("body", 0.1)) * 2.0) * _exp_env(n, float(p.get("decay", 0.1)), sr)
+
+
+def drum_buffer(voice: dict, key: int, sr: int, seed: int = 1337) -> np.ndarray:
+    """One hit (unit velocity) of Castle drum piece `key` (36-42)."""
+    group_flag = DRUM_KEYS.get(int(key))
+    params = voice.get("params") or {}
+    if not group_flag:
+        return np.zeros(int(0.05 * sr), dtype=np.float32)
+    group, flag = group_flag
+    if not params.get(flag, True):
+        return np.zeros(int(0.05 * sr), dtype=np.float32)
+    p = params.get(group) or {}
+    decay = float(p.get("decay", 0.2))
+    n = max(int(0.05 * sr), int(decay * 1.3 * sr))
+    t = np.arange(n) / sr
+    rng = np.random.default_rng(seed + int(key))
+    if group == "kick":
+        f0 = float(p.get("freq", 80.0)); sweep = float(p.get("sweep", 0.6))
+        f = f0 * (1.0 + sweep * 4.0 * np.exp(-t * 40.0))
+        sig = np.sin(2 * math.pi * np.cumsum(f) / sr) * _exp_env(n, decay, sr)
+        click = rng.uniform(-1, 1, n) * np.exp(-t * 400.0) * float(p.get("punch", 0.9)) * 0.4
+        sig = sig + click
+    elif group in ("loTom", "hiTom"):
+        f0 = 60.0 + float(p.get("freq", 0.75)) * 220.0
+        if group == "hiTom":
+            f0 *= 1.5
+        f = f0 * (1.0 + 0.5 * np.exp(-t * 25.0))
+        sig = np.sin(2 * math.pi * np.cumsum(f) / sr) * _exp_env(n, decay, sr)
+    elif group == "snare":
+        tam = float(p.get("tambre", 0.5))
+        body = np.sin(2 * math.pi * (140.0 + float(p.get("freq", 0.5)) * 180.0) * t)
+        rattle = np.diff(rng.uniform(-1, 1, n + 1))
+        sig = (body * (1.0 - tam * 0.5) * 0.6 + rattle * (0.3 + tam * 0.5)) * _exp_env(n, decay, sr)
+    elif group == "clap":
+        raw = np.diff(rng.uniform(-1, 1, n + 1))
+        env = _exp_env(n, decay, sr)
+        for off in (0.0, 0.011, 0.022):                      # 3 quick bursts, then a tail
+            i = int(off * sr)
+            env[i:i + int(0.008 * sr)] += 0.8
+        sig = raw * env * 0.5
+    else:                                                    # closedHat / openHat
+        sig = _hat(p, n, rng, sr)
+    peak = float(np.max(np.abs(sig))) if len(sig) else 0.0
+    if peak > 1.0:                                           # stacked parts (kick click, clap bursts)
+        sig = sig / peak
+    return (sig * DRUM_GAIN).astype(np.float32)
 
 
 def step_seconds(bpm: float) -> float:
@@ -104,6 +176,14 @@ def voices_from_music(music: dict) -> tuple[list[dict], list[str]]:
         inst = track.get("instrument") or {}
         sample = inst.get("sample") or {}
         props = inst.get("props") or {}
+        if inst.get("type") == "drums":
+            voices.append({
+                "drums": True,
+                "params": inst.get("params") or {},
+                "vol": float(props.get("volume", 1.0)),
+                "muted": bool(props.get("muted", False)),
+            })
+            continue
         if sample.get("type") not in (None, "tone"):
             warnings.append(f"Track {ti + 1}: '{sample.get('type')}' samples can't be previewed; using a sine tone.")
         voices.append({
@@ -120,6 +200,8 @@ def voices_from_music(music: dict) -> tuple[list[dict], list[str]]:
 
 def note_buffer(voice: dict, key: float, sr: int, seed: int = 1337) -> np.ndarray:
     """One note of this voice (unit velocity): oscillator x attack/release envelope."""
+    if voice.get("drums"):
+        return (drum_buffer(voice, int(key), sr, seed) * voice["vol"]).astype(np.float32)
     dur = max(0.05, voice["attack"] + voice["release"])
     n = int(dur * sr)
     rng = np.random.default_rng(seed + int(key))

@@ -10,7 +10,7 @@ tr.append(mido.Message("program_change", program=80, channel=0, time=0))
 for i, n in enumerate((69, 69, 72)):
     tr.append(mido.Message("note_on", note=n, velocity=100, time=0 if i == 0 else 480)); tr.append(mido.Message("note_off", note=n, velocity=0, time=10))
 dr = mido.MidiTrack(); mid.tracks.append(dr)
-dr.append(mido.Message("note_on", note=38, velocity=110, channel=9, time=0))
+dr.append(mido.Message("note_on", note=38, velocity=110, channel=9, time=240))  # after the 50ms pitch window: a snare is broadband now
 music = ct.build_music(mid); bpm = ct.get_bpm(mid)
 st = synth.music_stats(music, bpm)
 assert st["tracks"] == 2 and st["notes"] == 4 and abs(st["seconds"] - 980/480*0.5) < 1e-3, st
@@ -42,3 +42,33 @@ eng3 = live_synth.LiveSynth(music, bpm, Bad); eng3.play(); time.sleep(0.3); asse
 music["song"]["tracks"][0]["instrument"]["props"]["muted"] = True
 assert len(live_synth.LiveSynth(music, bpm, lambda: sink).notes) == 1
 print("synth ok")
+
+# ── percussion -> Castle drums ──
+dm = mido.MidiFile(ticks_per_beat=480)
+t1 = mido.MidiTrack(); dm.tracks.append(t1)
+t1.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(120)))
+# one pitched note + GM drum hits sharing ONE track (type-0 style), plus an unmapped cowbell (56)
+t1.append(mido.Message("note_on", note=60, velocity=100, channel=0, time=0))
+gm_hits = [46, 42, 39, 38, 47, 41, 36, 56]
+for i, n in enumerate(gm_hits):
+    t1.append(mido.Message("note_on", note=n, velocity=100, channel=9, time=0 if i == 0 else 480))
+dmusic = ct.build_music(dm)
+tr = dmusic["song"]["tracks"]
+assert [t["instrument"]["type"] for t in tr] == ["sampler", "drums"], tr
+drum = tr[1]; pat = dmusic["song"]["patterns"][drum["sequence"]["0.000000"]["patternId"]]
+# open hat, hat, clap, snare, high tom, low tom, kick -> keys 42..36 (cowbell dropped)
+got = [pat["notes"][k][0]["key"] for k in sorted(pat["notes"], key=float)]
+assert got == [42, 41, 40, 39, 38, 37, 36], got
+assert all(set(n) == {"key"} for ns in pat["notes"].values() for n in ns)
+assert drum["instrument"]["params"]["kick"]["freq"] == 80 and drum["instrument"]["props"]["name"] == "drums"
+# the preview synth renders every drum piece, audibly and bounded
+voices, warns = synth.voices_from_music(dmusic)
+assert warns == [] and voices[1]["drums"], (voices, warns)
+for k in range(36, 43):
+    b = synth.note_buffer(voices[1], k, 22050)
+    assert len(b) > 1000 and 0.02 < abs(b).max() <= 1.0, (k, abs(b).max())
+# a drum-channel-only file with nothing mappable adds no track
+em = mido.MidiFile(ticks_per_beat=480); et = mido.MidiTrack(); em.tracks.append(et)
+et.append(mido.Message("note_on", note=56, velocity=100, channel=9, time=0))
+assert ct.build_music(em)["song"]["tracks"] == []
+print("drums ok")
