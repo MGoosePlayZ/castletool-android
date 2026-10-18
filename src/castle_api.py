@@ -10,6 +10,7 @@ import hashlib
 import json
 import secrets
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 import requests
@@ -77,11 +78,14 @@ class CastleAPIError(Exception):
 
 # Castle's uploads go through AWS API Gateway, which refuses anything over 10 MB.
 UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024
-TOO_LARGE_MESSAGE = "This deck is over Castle's 10 MB upload limit. Remove some media and try again."
+TOO_LARGE_MESSAGE = "This card is over Castle's 10 MB upload limit. Remove some media and try again."
 
 
 class UploadTooLarge(CastleAPIError):
-    """The deck is bigger than Castle accepts in one upload."""
+    """A card (or image) is bigger than Castle accepts in one upload."""
+
+
+IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg"}
 
 
 def http_error_message(status: int, body: str = "") -> str:
@@ -110,25 +114,21 @@ class CastleAPI:
 
     # ── transport ────────────────────────────────────────────────────────
 
-    def _call(self, query: str, variables: Optional[dict] = None) -> dict:
+    def _headers(self) -> dict:
         headers = {
             # Identify as the CLI: the server keys API behavior off these.
             "X-OS": "cli",
             "X-CLI-API-Version": "4",
             "X-Scene-Creator-Version": "latest",
             "Accept": "application/json",
-            "Content-Type": "application/json",
         }
         if self.token:
             headers["X-Auth-Token"] = self.token
+        return headers
 
+    def _post(self, **kwargs) -> dict:
         try:
-            resp = self._session.post(
-                API_HOST,
-                data=json.dumps({"query": query, "variables": variables or {}}),
-                headers=headers,
-                timeout=self.timeout,
-            )
+            resp = self._session.post(API_HOST, timeout=self.timeout, **kwargs)
         except (requests.ConnectionError, requests.Timeout) as ex:
             raise OfflineError(str(ex)) from ex
         try:
@@ -145,6 +145,10 @@ class CastleAPI:
         if resp.status_code >= 400:
             raise CastleAPIError(http_error_message(resp.status_code))
         return body["data"]
+
+    def _call(self, query: str, variables: Optional[dict] = None) -> dict:
+        headers = {**self._headers(), "Content-Type": "application/json"}
+        return self._post(data=json.dumps({"query": query, "variables": variables or {}}), headers=headers)
 
     # ── auth ─────────────────────────────────────────────────────────────
 
@@ -244,7 +248,7 @@ class CastleAPI:
                 lastModified
                 playCount
                 playTime
-                initialCard { cardId title backgroundColor backgroundImage { url } }
+                initialCard { cardId title backgroundColor backgroundImage { url smallUrl } }
                 cards { cardId title }
               }
             }""",
@@ -300,6 +304,31 @@ class CastleAPI:
         if r.status_code >= 300:
             raise CastleAPIError(http_error_message(r.status_code, r.text))
         return cfg["uploadId"]
+
+    def upload_file(self, path: Path) -> dict:
+        """Upload an image (png/jpg) via the uploadFile mutation (GraphQL multipart request
+        spec: operations + map + file part). Returns {"fileId", "url"}: pass fileId as
+        `backgroundImageFileId` on the next updateCardAndDeckV2; url is a ready-to-show link."""
+        path = Path(path)
+        mime = IMAGE_MIME.get(path.suffix.lower())
+        if not mime:
+            raise CastleAPIError("Cover images must be PNG or JPEG.")
+        data = path.read_bytes()
+        if len(data) > UPLOAD_LIMIT_BYTES:
+            raise UploadTooLarge(f"That image is {len(data) / 1048576:.1f} MB, over Castle's "
+                                 f"{UPLOAD_LIMIT_BYTES // 1048576} MB upload limit.")
+        operations = json.dumps({
+            "query": "mutation UploadFile($file: Upload!) { uploadFile(file: $file) { fileId url } }",
+            "variables": {"file": None},
+        })
+        result = self._post(
+            data={"operations": operations, "map": json.dumps({"0": ["variables.file"]})},
+            files={"0": (path.name, data, mime)},
+            headers=self._headers(),          # no Content-Type: requests adds the multipart boundary
+        ).get("uploadFile")
+        if not result or not result.get("fileId"):
+            raise CastleAPIError("Castle didn't accept the image.")
+        return result
 
     def update_card_and_deck_v2(self, deck: dict, card: dict) -> dict:
         data = self._call(

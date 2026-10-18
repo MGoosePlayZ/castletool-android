@@ -8,6 +8,8 @@ from typing import Callable, Optional
 import flet as ft
 
 import blueprint_ops as ops
+import deck_store
+import tasks
 import theme
 from session import CardSession
 from theme import BG, DANGER, MAJOR, MINOR1, SEP, castle_icon, text
@@ -89,7 +91,7 @@ def card_bar(app, ctx: CardContext, mode: str) -> ft.Control:
 
 
 def card_settings_dialog(app, ctx: CardContext):
-    from screens_library import card_bg
+    from screens_library import card_bg, swatch
     bg = {"v": card_bg(ctx.card_dir)}
     tempo = {"v": f"{ops.card_tempo(ctx.card_dir):g}"}
     color = ColorField(app, bg["v"], lambda v: bg.update(v=v))
@@ -117,9 +119,34 @@ def card_settings_dialog(app, ctx: CardContext):
             return
         app.refresh()
 
+    async def pick_cover(e):
+        path = await app.pick(["png", "jpg", "jpeg"], "Choose a cover image")
+        if not path:
+            return
+        if not await app.ensure_online():
+            return
+        app.close_dialog(holder["dlg"])
+
+        def upload(task):
+            with tasks.use(task):
+                tasks.say("Uploading image", 0.2)
+                result = app.api.upload_file(path)
+                deck_store.set_pending_cover(ctx.card_dir, result["fileId"], result["url"])
+            return True
+
+        if await ctx.edit_async("Uploading cover", upload):       # undo / discard put the old cover back
+            app.toast("Cover changed. Save to apply it.")
+            app.refresh()
+
+    cover_btn = ft.Container(ft.Row([
+        swatch(bg["v"], 28, deck_store.card_cover_url(ctx.deck_dir, ctx.card_id)),
+        text("Cover image", 14, MAJOR, bold=True)], spacing=10, tight=True),
+        ink=True, on_click=pick_cover, border_radius=8, padding=ft.Padding.symmetric(vertical=4, horizontal=6))
     row = lambda icon, control: ft.Row([ft.Container(castle_icon(icon, 22, MINOR1), width=34), control],
                                        vertical_alignment=ft.CrossAxisAlignment.CENTER)
-    holder["dlg"] = app.dialog("Card", ft.Column([row("bucket", color.control), row("drums", tempo_box.control)],
+    holder["dlg"] = app.dialog("Card", ft.Column([row("bucket", color.control), row("drums", tempo_box.control),
+                                                  ft.Row([ft.Container(castle_icon("picture", 22, MINOR1), width=34), cover_btn],
+                                                         vertical_alignment=ft.CrossAxisAlignment.CENTER)],
                                                  tight=True, spacing=14, width=280), [
         ft.TextButton(content=text("Save", 14, MAJOR, bold=True), on_click=save)])
 

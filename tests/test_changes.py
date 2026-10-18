@@ -48,7 +48,7 @@ try: ds.detect_cauldron(Down(), deck, cache); raise SystemExit("offline passed")
 except OSError: pass
 assert "c9" not in json.loads(cache.read_text())                                       # failures aren't cached
 
-# ---- upload limit (whole deck) + readable HTTP errors
+# ---- upload limit (per card: each card is its own upload) + readable HTTP errors
 import castle_api as ca
 assert ca.http_error_message(413, "<html>big</html>") == ca.TOO_LARGE_MESSAGE
 assert ca.http_error_message(502, "<html><body>Bad gateway</body></html>") == "Castle returned an error (HTTP 502)."
@@ -60,15 +60,26 @@ for cid, n in (("a", 6), ("b", 6)):                                             
     (cd / "scene/blueprints/x.json").write_text(json.dumps({"entryId": "x" + cid, "pad": "z" * (n * 1024 * 1024)}))
 (big / "deck.json").write_text(json.dumps({"deckId": "big", "cards": [{"cardId": "a"}, {"cardId": "b"}], "initialCard": {"cardId": "a"}}))
 size = ds.deck_upload_size(big); assert 12 * 1048576 < size < 12.1 * 1048576, size
-try: ds.assert_deck_fits(big); raise SystemExit("12 MB deck accepted")
-except ca.UploadTooLarge as ex: assert "12.0 MB" in str(ex) and "10 MB" in str(ex), ex
+assert 6 * 1048576 < ds.card_upload_size(big / "cards/a") < 6.1 * 1048576
+ds.assert_deck_fits(big)                                                                 # 12 MB in total is fine: no single card is over 10 MB
+class Rec:
+    def __init__(self): self.up = []; self.saved = []
+    def upload_scene_data(self, cid, sd): self.up.append(cid); return "up-" + cid
+    def update_card_and_deck_v2(self, d, c):
+        self.saved.append(c["cardId"]); return {"deck": {"deckId": d["deckId"]}, "card": {"cardId": c["cardId"]}}
+    def card(self, cid): return None
+r = Rec(); ds.push_card(r, big, "a"); assert r.up == ["a"]                               # only card a is measured and sent
+r = Rec(); ds.push_deck(r, big, log=lambda m: None); assert r.up == ["a", "b"] and r.saved == ["a", "b"]
+(big / "cards/b/scene/blueprints/x.json").write_text(json.dumps({"entryId": "xb", "pad": "z" * (11 * 1024 * 1024)}))
+try: ds.assert_card_fits(big / "cards/b"); raise SystemExit("11 MB card accepted")
+except ca.UploadTooLarge as ex: assert "Card b" in str(ex) and "11.0 MB" in str(ex) and "10 MB" in str(ex), ex
 class Net:
     def __getattr__(self, n): raise SystemExit("network touched: " + n)
-for fn in (lambda: ds.push_deck(Net(), big), lambda: ds.push_card(Net(), big, "a")):
-    try: fn(); raise SystemExit("pushed")
-    except ca.UploadTooLarge: pass                                                      # refused before any network call
-(big / "cards/b/scene/blueprints/x.json").write_text(json.dumps({"entryId": "xb", "pad": "z" * 1000}))
-ds.assert_deck_fits(big)                                                                 # 6 MB deck is fine
+try: ds.push_deck(Net(), big); raise SystemExit("pushed")
+except ca.UploadTooLarge: pass                                                           # refused before any network call
+try: ds.push_card(Net(), big, "b"); raise SystemExit("pushed")
+except ca.UploadTooLarge: pass
+r = Rec(); ds.push_card(r, big, "a"); assert r.up == ["a"]                               # card a is still fine on its own
 
 # ---- video with sound: failures are reported, not silent
 import blueprint_ops as ops, castletool_core as ct, media_av, av
@@ -149,13 +160,31 @@ gif = tmp / "g.gif"; fr_ = [Image.new("RGB", (16, 16), col) for col in ((255, 0,
 info = ops.inspect_media(gif, log=print)
 dd = sb.ImportDialog(view, gif, info, layer="layer2"); dd.options.controls = dd.option_controls(); assert dd.layer == "layer2"
 # the deck's top card uses cauldron: message, no cards
-screen = lib.deck_screen(app, d); host = screen.build(app); drain()
-assert host.content.content.value == "This deck uses cauldron" and not any(isinstance(x, ft.Row) for x in [host.content.content])
+app.push(lib.deck_screen(app, d)); host = app.body.content; assert isinstance(host.content, ft.ProgressRing); drain()
+assert app.body.content is not host and app.body.content.content.value == "This deck uses cauldron"   # rebuilt, not swapped into the spinner's placeholder
+app.pop()
 assert ds.cauldron_status(app.cauldron_cache, d) == (True, False)
 host2 = lib.deck_screen(app, d).build(app); assert host2.content.value == "This deck uses cauldron"                # now straight from the cache
 (d / "deck.json").write_text(_j.dumps({"deckId": "deck1", "initialCard": {"cardId": "card2"}, "cards": [{"cardId": "card1"}]}))
 assert not isinstance(lib.deck_screen(app, d).build(app), ft.Container) or lib.deck_screen(app, d).build(app).content is not None
 plain = lib.deck_screen(app, d).build(app); assert isinstance(plain, ft.Column)                                   # no sceneDataUrl, not cached: cards shown
+# first open after a fresh clone (answer not cached yet): the cards end up in a rebuilt screen, not in the spinner host
+(d / "deck.json").write_text(_j.dumps({"deckId": "deck1", "initialCard": {"cardId": "card3", "sceneDataUrl": "http://s/n"}, "cards": [{"cardId": "card1"}]}))
+app.api.download_scene_data = lambda u: {"snapshot": {}}
+app.push(lib.deck_screen(app, d)); host = app.body.content; assert isinstance(host.content, ft.ProgressRing); drain()
+assert app.body.content is not host and isinstance(app.body.content, ft.Column), type(app.body.content); app.pop()
+# double tap on a deck: the overlay is up before any network check, and a second tap is ignored
+import time as _t
+clones = []; seen = []
+d9 = app.decks_dir / "deck9"; d9.mkdir(); (d9 / "deck.json").write_text(_j.dumps({"deckId": "deck9", "cards": []}))
+def slow_clone(deck_id, task=None): clones.append(deck_id); _t.sleep(0.2); return d9
+async def fake_profile(): seen.append(len(page.dialogs)); app.online = True
+app.fresh_clone = slow_clone; app.refresh_profile = fake_profile; app.online = False; app.stack[:] = app.stack[:1]
+async def taps(): await asyncio.gather(app.open_deck("deck9", None), app.open_deck("deck9", None))
+asyncio.run(taps())
+assert clones == ["deck9"] and seen == [1], (clones, seen)                # one clone, overlay already shown while checking the network
+assert app.opening == set() and len(app.stack) == 2 and not page.dialogs, (app.opening, len(app.stack), page.dialogs)
+app.pop()
 # back button: Decks screen keeps the system behaviour, everything else is intercepted
 app.stack.clear(); app._setup_back(); assert Page.views[0].on_confirm_pop == app._on_confirm_pop
 app.push(lib.home_screen(app)); assert Page.views[0].can_pop is True

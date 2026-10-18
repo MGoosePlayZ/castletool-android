@@ -14,7 +14,7 @@ import tasks
 import theme
 from app import App, Screen, profile_screen
 from cardbar import CardContext, card_bar, leave_card
-from deck_store import cauldron_status, detect_cauldron, list_local_decks
+from deck_store import card_cover_url, cauldron_status, detect_cauldron, list_local_decks
 from theme import BG, MAJOR, MINOR1, SEP, castle_icon, md_icon, minor, text
 from widgets import icon_button, pill_button
 
@@ -53,6 +53,12 @@ def fmt_date(value) -> str:
     return datetime.fromtimestamp(ts).strftime("%m/%d/%y") if ts else "--/--/--"
 
 
+def cover_of(card: dict) -> str:
+    """Small cover-image link of a deck.json card entry ('' if it has none)."""
+    img = (card or {}).get("backgroundImage")
+    return (img.get("smallUrl") or img.get("url") or "") if isinstance(img, dict) else ""
+
+
 def deck_info(deck_dir: Path) -> dict:
     d = read_json(deck_dir / "deck.json")
     initial = d.get("initialCard") or {}
@@ -65,6 +71,7 @@ def deck_info(deck_dir: Path) -> dict:
         "lastModified": d.get("lastModified"),
         "playCount": d.get("playCount") or 0,
         "bg": valid_hex(initial.get("backgroundColor")),
+        "cover": cover_of(initial),
     }
 
 
@@ -78,6 +85,7 @@ def remote_info(d: dict) -> dict:
         "lastModified": d.get("lastModified"),
         "playCount": d.get("playCount") or 0,
         "bg": valid_hex(d.get("bg")),
+        "cover": d.get("cover") or "",
     }
 
 
@@ -118,9 +126,15 @@ def blueprint_files(card_dir: Path) -> list[Path]:
     return sorted(bp_dir.glob("*.json")) if bp_dir.exists() else []
 
 
-def swatch(bg: str, width: float) -> ft.Container:
-    return ft.Container(width=width, height=width * CARD_RATIO, bgcolor=valid_hex(bg),
-                        border_radius=width * 0.12, border=ft.Border.all(1, SEP))
+def swatch(bg: str, width: float, cover: str = "") -> ft.Container:
+    """A card-shaped thumbnail: the cover image when there is one (the background colour shows
+    while it loads, or when it can't, e.g. offline), else just the colour."""
+    height = width * CARD_RATIO
+    image = ft.Image(src=cover, width=width, height=height, fit=ft.BoxFit.COVER,
+                     gapless_playback=True, error_content=ft.Container()) if cover else None
+    return ft.Container(image, width=width, height=height, bgcolor=valid_hex(bg),
+                        border_radius=width * 0.12, border=ft.Border.all(1, SEP),
+                        clip_behavior=ft.ClipBehavior.ANTI_ALIAS)
 
 
 # ── decks ──────────────────────────────────────────────────────────────────
@@ -234,7 +248,7 @@ def deck_row(app: App, d: dict) -> ft.Control:
     local_dir: Optional[Path] = d["dir"]
     return ft.Container(
         content=ft.Row([
-            swatch(d["bg"], 36),
+            swatch(d["bg"], 36, d.get("cover", "")),
             ft.Container(text(label, 15, medium=True, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS), expand=True),
             ft.Container(date, width=82),
             ft.Container(plays, width=52, alignment=ft.Alignment.CENTER_RIGHT),
@@ -257,8 +271,7 @@ def deck_screen(app: App, deck_dir: Path) -> Screen:
             cdir = deck_dir / "cards" / cid
             tiles.append(ft.Container(
                 content=ft.Column([
-                    ft.Container(width=104, height=104 * CARD_RATIO, bgcolor=card_bg(cdir), border_radius=12,
-                                 border=ft.Border.all(1, SEP)),
+                    swatch(card_bg(cdir), 104, card_cover_url(deck_dir, cid)),
                     minor(cid, 10, text_align=ft.TextAlign.CENTER, width=104, max_lines=2),
                 ], spacing=4, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
                 ink=True, border_radius=12,
@@ -285,13 +298,19 @@ def deck_screen(app: App, deck_dir: Path) -> Screen:
 
         async def check():
             try:
-                found = await asyncio.to_thread(detect_cauldron, a.api, deck_dir, a.cauldron_cache)
+                await asyncio.to_thread(detect_cauldron, a.api, deck_dir, a.cauldron_cache)
             except Exception as ex:             # offline etc.: show the cards, ask again next time
                 a.log(f"cauldron check: {ex}", 2)
-                found = False
+                if state["alive"]:
+                    host.alignment = None
+                    host.content = body(a, False)
+                    a.page.update()
+                return
             if state["alive"]:
-                host.content = body(a, found)
-                a.page.update()
+                # The answer is cached now, so rebuilding takes the same path as re-entering the
+                # screen. Swapping the cards into the spinner's centred placeholder left them
+                # offset until the screen was rebuilt ("ghost" card).
+                a.refresh_body_if("Deck")
 
         a.page.run_task(check)
         return host

@@ -156,6 +156,7 @@ class App:
         self.log_entries: list[tuple[float, int, str]] = []
         self.log_targets: list[ft.Column] = []
         self.active_tasks: set[tasks.Task] = set()
+        self.opening: set[str] = set()              # deck ids currently being opened
         self.login_cancel = False
         self.last_work_cancelled = False
         self._bar_sig = None
@@ -540,17 +541,21 @@ class App:
                 self.toast(str(ex), error=True)
         return None
 
-    async def work(self, label: str, fn, *args, progress: bool = True, report: bool = True):
+    async def work(self, label: str, fn, *args, progress: bool = True, report: bool = True,
+                   task: Optional[tasks.Task] = None, view: Optional["ProgressView"] = None):
         """Run `fn(task, *args)` on a worker thread with a cancellable Task. While it runs
         the screen is greyed out and a circular meter shows percentage and a status line.
-        Returns fn's result, or None if it failed or was cancelled."""
-        task = tasks.Task(label, on_message=lambda m: self.log(f"[{label}] {m}", 2))
-        view = ProgressView(self, task) if progress else None
+        Returns fn's result, or None if it failed or was cancelled.
+        `task` / `view`: reuse an overlay the caller already put on screen (see open_deck)."""
+        task = task or tasks.Task(label, on_message=lambda m: self.log(f"[{label}] {m}", 2))
+        if view is None and progress:
+            view = ProgressView(self, task)
         self.active_tasks.add(task)
         t0 = time.monotonic()
         self.log(f"{label}: started", 2)
         if view:
-            view.show()
+            if not view.shown:
+                view.show()
             view.update(task)
         try:
             result = await self.run(fn, task, *args, report=report)
@@ -678,7 +683,7 @@ class App:
     def fresh_clone(self, deck_id: str, task: Optional[tasks.Task] = None) -> Path:
         """Clone into a scratch folder, then swap it in: a failed or cancelled clone never
         destroys the copy already on the device."""
-        scratch = self.decks_dir / ".incoming"
+        scratch = self.decks_dir / ".incoming" / deck_id          # one scratch dir per deck, never shared
         shutil.rmtree(scratch, ignore_errors=True)
         try:
             with tasks.use(task):
@@ -689,6 +694,10 @@ class App:
             shutil.move(str(scratch / deck_id), str(target))
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
+            try:
+                scratch.parent.rmdir()                            # only succeeds when no other clone is running
+            except OSError:
+                pass
         self.clear_sessions(deck_id)
         return self.decks_dir / deck_id
 
@@ -710,26 +719,44 @@ class App:
         """Opening a deck re-clones it from Castle, unless that would lose unsaved
         edits or Castle can't be reached (then the copy on the device is used)."""
         from screens_library import deck_screen
+        if deck_id in self.opening:                    # a second tap while the first is still working
+            return
         has_local = bool(local_dir and local_dir.exists())
         if has_local and deck_has_unsaved(local_dir):
             self.push(deck_screen(self, local_dir))
             return
-        if self.api.token and (self.online or not has_local):
-            if not self.online:
-                await self.refresh_profile()
-            if self.online:
-                path = await self.work("Opening deck", lambda task: self.fresh_clone(deck_id, task))
-                if path:
-                    self.push(deck_screen(self, path))
+        self.opening.add(deck_id)
+        # Cover the screen at once (placeholder text until real progress arrives) so a second
+        # tap can't start a second clone while the network checks below are still running.
+        task = tasks.Task("Opening deck", on_message=lambda m: self.log(f"[Opening deck] {m}", 2))
+        view = ProgressView(self, task)
+        view.show()
+        task.update(None, "Loading…", force=True)
+        try:
+            if self.api.token and (self.online or not has_local):
+                if not self.online:
+                    await self.refresh_profile()
+                if task.cancelled:
                     return
-                if not has_local or self.last_work_cancelled:
-                    return
-        if has_local:
-            self.push(deck_screen(self, local_dir))
-        elif not self.api.token:
-            self.toast("Sign in first.", error=True)
-        else:
-            self.toast("No Wi-Fi.", error=True)
+                if self.online:
+                    path = await self.work("Opening deck", lambda t: self.fresh_clone(deck_id, t),
+                                           task=task, view=view)
+                    if path:
+                        view.close()
+                        self.push(deck_screen(self, path))
+                        return
+                    if not has_local or self.last_work_cancelled:
+                        return
+            view.close()
+            if has_local:
+                self.push(deck_screen(self, local_dir))
+            elif not self.api.token:
+                self.toast("Sign in first.", error=True)
+            else:
+                self.toast("No Wi-Fi.", error=True)
+        finally:
+            view.close()
+            self.opening.discard(deck_id)
 
     def ask_delete_deck(self, deck_dir: Path, name: str):
         unsaved = deck_has_unsaved(deck_dir)

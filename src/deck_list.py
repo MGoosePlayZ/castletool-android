@@ -43,6 +43,7 @@ def to_listed_deck(deck: dict) -> dict:
         "initialCardId": initial.get("cardId"),
         "initialCardTitle": initial.get("title") or "",
         "bg": initial.get("backgroundColor"),
+        "cover": ((initial.get("backgroundImage") or {}).get("smallUrl") or "") if isinstance(initial.get("backgroundImage"), dict) else "",
     }
 
 

@@ -298,8 +298,18 @@ def materialize_card(card_dir: Path) -> dict:
     return {"snapshot": snapshot}
 
 
+def _payload_size(payload: dict) -> int:
+    return len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def card_upload_size(card_dir: Path) -> int:
+    """Bytes of ONE card's scene data when uploaded. Each card is its own upload, so this is
+    the size Castle's limit applies to."""
+    return _payload_size(materialize_card(Path(card_dir)))
+
+
 def deck_upload_size(deck_dir: Path) -> int:
-    """Bytes the whole deck's scene data comes to when uploaded (every project-format card)."""
+    """Bytes all of the deck's scene data comes to (informational: cards upload one by one)."""
     deck_dir = Path(deck_dir)
     deck = _read_json(deck_dir / "deck.json")
     cards = deck.get("cards") or ([deck["initialCard"]] if deck.get("initialCard") else [])
@@ -309,19 +319,112 @@ def deck_upload_size(deck_dir: Path) -> int:
         if not card.get("cardId") or not is_project_card_dir(card_dir):
             continue
         try:
-            payload = materialize_card(card_dir)
+            total += card_upload_size(card_dir)
         except FileNotFoundError:
             continue
-        total += len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
     return total
 
 
-def assert_deck_fits(deck_dir: Path, limit: int = UPLOAD_LIMIT_BYTES) -> None:
-    """Refuse to upload a deck Castle would reject: the check covers the whole deck."""
-    size = deck_upload_size(deck_dir)
+def assert_card_fits(card_dir: Path, limit: int = UPLOAD_LIMIT_BYTES) -> None:
+    """Refuse to upload a card Castle would reject."""
+    size = card_upload_size(card_dir)
     if size > limit:
-        raise UploadTooLarge(f"This deck is {size / 1048576:.1f} MB, over Castle's {limit // 1048576} MB "
-                             "upload limit. Remove some media and try again.")
+        raise UploadTooLarge(f"Card {Path(card_dir).name} is {size / 1048576:.1f} MB, over Castle's "
+                             f"{limit // 1048576} MB upload limit. Remove some media and try again.")
+
+
+def assert_deck_fits(deck_dir: Path, limit: int = UPLOAD_LIMIT_BYTES) -> None:
+    """Check every card of the deck against the limit, one by one (the limit is per card,
+    not per deck)."""
+    deck_dir = Path(deck_dir)
+    deck = _read_json(deck_dir / "deck.json")
+    cards = deck.get("cards") or ([deck["initialCard"]] if deck.get("initialCard") else [])
+    for card in cards:
+        card_dir = deck_dir / "cards" / (card.get("cardId") or "")
+        if card.get("cardId") and is_project_card_dir(card_dir):
+            try:
+                assert_card_fits(card_dir, limit)
+            except FileNotFoundError:
+                continue
+
+
+# ── cover images ─────────────────────────────────────────────────────────
+# A card's cover is `backgroundImage` {url, smallUrl, largeCardUrl} in card.json and deck.json.
+# Picking a new image uploads it right away and parks the result in card.json
+# (backgroundImageFileId + the new links), so the card turns dirty and undo / discard work.
+# Save sends the fileId; only then do the links move into deck.json (initial card = its source card).
+
+_CASTLE_IMAGE_HOST = "image.castle.xyz"
+
+
+def cover_urls(url: str) -> dict:
+    """Display links for an uploaded image. Castle's image host serves resized variants via query
+    params (same ones deck.json already carries); any other url is used as-is for all three."""
+    base = (url or "").split("?", 1)[0]
+    if _CASTLE_IMAGE_HOST in base:
+        return {"url": f"{base}?h=400&format=png8&ar=5:7",
+                "smallUrl": f"{base}?h=280&format=png8&ar=5:7",
+                "largeCardUrl": f"{base}?h=800&format=png8&ar=5:7"}
+    return {"url": url, "smallUrl": url, "largeCardUrl": url}
+
+
+def set_pending_cover(card_dir: Path, file_id: str, url: str) -> None:
+    card_json_path = Path(card_dir) / "card.json"
+    card_json = _read_json(card_json_path) if card_json_path.exists() else {}
+    card_json["backgroundImageFileId"] = file_id
+    card_json["backgroundImage"] = cover_urls(url)
+    _write_json(card_json_path, card_json)
+
+
+def card_cover_url(deck_dir: Path, card_id: str) -> str:
+    """Small cover link for a card tile: card.json first (it may hold an unsaved new cover), then deck.json."""
+    deck_dir = Path(deck_dir)
+    try:
+        cj = _read_json(deck_dir / "cards" / card_id / "card.json")
+    except (OSError, ValueError):
+        cj = {}
+    img = cj.get("backgroundImage") if isinstance(cj, dict) else None
+    if not (isinstance(img, dict) and img.get("smallUrl")):
+        try:
+            deck = _read_json(deck_dir / "deck.json")
+        except (OSError, ValueError):
+            return ""
+        img = next((c.get("backgroundImage") for c in (deck.get("cards") or []) if c.get("cardId") == card_id), None)
+    return (img.get("smallUrl") or "") if isinstance(img, dict) else ""
+
+
+def _set_cover_in_deck(deck: dict, card_id: str, image: Optional[dict]) -> None:
+    for c in list(deck.get("cards") or []) + [deck.get("initialCard")]:
+        if isinstance(c, dict) and c.get("cardId") == card_id:
+            c["backgroundImage"] = copy.deepcopy(image)
+
+
+def _sync_initial_cover(deck: dict) -> None:
+    """The initial card's links are always its source card's links."""
+    initial = deck.get("initialCard")
+    if not isinstance(initial, dict):
+        return
+    src = next((c for c in deck.get("cards") or [] if c.get("cardId") == initial.get("cardId")), None)
+    if src is not None and "backgroundImage" in src:
+        initial["backgroundImage"] = copy.deepcopy(src["backgroundImage"])
+
+
+def _card_input(card: dict, card_json: dict, title: str, upload_id: str, is_initial: bool) -> dict:
+    result = {"cardId": card["cardId"], "title": title, "blocks": [],
+              "uploadId": upload_id, "makeInitialCard": is_initial}
+    if card_json.get("backgroundImageFileId"):
+        result["backgroundImageFileId"] = card_json["backgroundImageFileId"]
+    return result
+
+
+def _cover_saved(card_dir: Path, card_json_path: Path, deck: dict, card_id: str) -> bool:
+    """After a successful save: the pending cover is now on Castle. Returns True if deck changed."""
+    card_json = _read_json(card_json_path) if card_json_path.exists() else {}
+    if not card_json.pop("backgroundImageFileId", None):
+        return False
+    _write_json(card_json_path, card_json)
+    _set_cover_in_deck(deck, card_id, card_json.get("backgroundImage"))
+    return True
 
 
 def _assert_card_can_be_saved(api: CastleAPI, card_id: str, deck_id: str) -> None:
@@ -354,6 +457,11 @@ def push_deck(api: CastleAPI, deck_dir: Path, log: Log = print) -> str:
     cards = deck.get("cards") or ([deck["initialCard"]] if deck.get("initialCard") else [])
     if not cards:
         raise ValueError(f"No cards found in {deck_dir}.")
+    # Castle's limit applies to each card's upload, not to the deck as a whole: check them one
+    # by one up front so nothing is half-pushed.
+    total = deck_upload_size(deck_dir)
+    if total > UPLOAD_LIMIT_BYTES:
+        log(f"Deck is {total / 1048576:.1f} MB in total; cards upload one at a time, so that's fine.")
     assert_deck_fits(deck_dir)
     for card in cards:
         card["cardId"] = card.get("cardId") or make_id()
@@ -388,13 +496,8 @@ def push_deck(api: CastleAPI, deck_dir: Path, log: Log = print) -> str:
         if deck.get("multiplayerEnabledByCreator"):
             deck_input["multiplayerEnabledByCreator"] = True
 
-        result = api.update_card_and_deck_v2(deck_input, {
-            "cardId": card["cardId"],
-            "title": card.get("title") or f"Card {index + 1}",
-            "blocks": [],
-            "uploadId": upload_id,
-            "makeInitialCard": is_initial,
-        })
+        result = api.update_card_and_deck_v2(deck_input, _card_input(
+            card, card_json, card.get("title") or f"Card {index + 1}", upload_id, is_initial))
         if result["deck"]["deckId"] != deck["deckId"]:
             raise CastleAPIError(f"Server returned unexpected deck id {result['deck']['deckId']}.")
         if result["card"]["cardId"] != card["cardId"]:
@@ -403,9 +506,11 @@ def push_deck(api: CastleAPI, deck_dir: Path, log: Log = print) -> str:
         card.pop("sceneDataUrl", None)
         if is_initial:
             deck["initialCard"] = card
+        _cover_saved(card_dir, card_json_path, {"cards": cards}, card["cardId"])
         log(f"Saved card {card['cardId']}.")
 
     deck["cards"] = cards
+    _sync_initial_cover(deck)
     _write_json(deck_json_path, deck)
     url = f"https://castle.xyz/d/{deck['deckId']}"
     log(f"{'Created' if was_new else 'Updated'} {deck['visibility']} deck: {url}")
@@ -443,7 +548,7 @@ def push_card(api: CastleAPI, deck_dir: Path, card_id: str, log: Log = print) ->
     _write_json(card_json_path, card_json)
 
     tasks.say("Checking size", 0.05)
-    assert_deck_fits(deck_dir)
+    assert_card_fits(card_dir)                    # only this card: each card is its own upload
     tasks.say("Preparing card", 0.1)
     scene = materialize_card(card_dir)
     tasks.say("Uploading card", 0.3)
@@ -457,13 +562,11 @@ def push_card(api: CastleAPI, deck_dir: Path, card_id: str, log: Log = print) ->
     if is_initial:
         deck_input["initialCardId"] = card_id
         deck_input["variables"] = deck.get("variables") or []
-    result = api.update_card_and_deck_v2(deck_input, {
-        "cardId": card_id,
-        "title": card.get("title") or card_json["title"],
-        "blocks": [],
-        "uploadId": upload_id,
-        "makeInitialCard": is_initial,
-    })
+    result = api.update_card_and_deck_v2(deck_input, _card_input(
+        card, card_json, card.get("title") or card_json["title"], upload_id, is_initial))
     if result["deck"]["deckId"] != deck["deckId"] or result["card"]["cardId"] != card_id:
         raise CastleAPIError("Server returned unexpected ids.")
+    if _cover_saved(card_dir, card_json_path, deck, card_id):
+        _sync_initial_cover(deck)
+        _write_json(deck_json_path, deck)
     log(f"Saved card {card_id}.")
