@@ -21,6 +21,7 @@ from typing import Callable, Optional
 
 import castletool_core as ct
 import drawing
+import layers as lyr
 import media_av
 import tasks
 
@@ -28,7 +29,7 @@ media_av.install(ct)   # PyAV instead of ffmpeg/ffprobe subprocesses (works on p
 
 Log = Callable[[str], None]
 
-_state = {"token": None}
+_state = {"token": None, "errors": [], "warnings": []}
 _patch_lock = threading.Lock()
 
 
@@ -44,9 +45,10 @@ def _hook(log: Log, token: Optional[str]) -> None:
     ct.p = clean
     ct.pb = clean
     ct.pw = lambda m: log(f"warning: {m}")
-    ct.pe = lambda m: log(f"error: {m}")
+    ct.pe = lambda m: (_state["errors"].append(str(m)), log(f"error: {m}"))
     ct.ps = clean
     _state["token"] = token
+    _state["errors"] = []
 
     def get_token() -> str:
         if not _state["token"]:
@@ -72,6 +74,13 @@ def _guard(fn):
     wrapper.__name__ = fn.__name__
     wrapper.__doc__ = fn.__doc__
     return wrapper
+
+
+def take_warnings() -> list[str]:
+    """Problems the last import hit but carried on past (e.g. a video's sound that couldn't be
+    uploaded). Returns them once, for the UI to show."""
+    out, _state["warnings"] = _state["warnings"], []
+    return out
 
 
 def load_blueprint(path: Path) -> dict:
@@ -140,11 +149,53 @@ def inspect_media(src: Path, *, log: Log) -> dict:
             "names": [f.name for f in files][:50],
             "unsupported": unsupported,
             "has_audio": has_audio,
+            "audio_unsupported": has_audio and not media_av.can_encode_mp3(),
             "size": max(f.stat().st_size for f in files),
             "frames": _frames_in(files[0], cat),      # frames inside the first file (animation / video)
         }
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── layers ───────────────────────────────────────────────────────────────
+
+def drawing_layers(bp: dict) -> list[dict]:
+    """[{id, title, bitmap}] bottom layer first."""
+    return lyr.summary(components(bp).get("Drawing2"))
+
+
+def _put_drawing(actor: dict, d2: dict, layer: Optional[str]) -> None:
+    """Store an imported drawing: replaces the Drawing2 (layer None) or goes into one layer."""
+    comps = actor["actorBlueprint"]["components"]
+    try:
+        comps["Drawing2"] = lyr.apply_drawing(comps.get("Drawing2"), d2, layer)
+    except lyr.LayerError as e:
+        raise OpError(str(e))
+
+
+def _edit_drawing(bp_path: Path, fn) -> None:
+    bp = load_blueprint(bp_path)
+    d2 = components(bp).get("Drawing2")
+    if not d2 or not lyr.layers_of(d2):
+        raise OpError("This blueprint has no drawing.")
+    try:
+        fn(d2)
+    except lyr.LayerError as e:
+        raise OpError(str(e))
+    write_blueprint(bp_path, bp)
+
+
+def rename_layer(bp_path: Path, layer_id: str, name: str) -> None:
+    _edit_drawing(bp_path, lambda d2: lyr.rename_layer(d2, layer_id, name))
+
+
+def delete_layer(bp_path: Path, layer_id: str) -> None:
+    _edit_drawing(bp_path, lambda d2: lyr.delete_layer(d2, layer_id))
+
+
+def move_layer(bp_path: Path, old_index: int, new_index: int) -> None:
+    """Storage-order indices (0 = bottom layer)."""
+    _edit_drawing(bp_path, lambda d2: lyr.move_layer(d2, old_index, new_index))
 
 
 # ── media (image / animation / video / svg) ──────────────────────────────
@@ -350,9 +401,16 @@ def _font_codepoints(opts: dict) -> list[int]:
 
 
 @_guard
-def import_media(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Log) -> list[Path]:
-    """Port of do_add_image(). Returns the blueprint files written."""
+def import_media(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Log,
+                 layer: Optional[str] = None) -> list[Path]:
+    """Port of do_add_image(). Returns the blueprint files written.
+
+    layer: None = the file becomes the blueprint's whole drawing; lyr.NEW = it is added as a
+    new layer; a layer id = it overwrites that layer (other layers are left alone)."""
     o = {**DEFAULT_MEDIA_OPTS, **(opts or {})}
+    if layer is not None:
+        o["layout"] = "frames"                  # several images become frames of the one layer
+    _state["warnings"] = []
     bp_path, card_dir, src = Path(bp_path), Path(card_dir), Path(src)
     if not ct.HAS_PIL:
         raise OpError("Pillow is not installed.")
@@ -372,6 +430,9 @@ def import_media(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: L
             raise OpError("Nothing left to import.")
         if cat == "video" and not ct.HAS_FFMPEG:
             raise OpError("Video isn't supported on this device.")
+        if layer is not None and len(files) > 1 and cat not in ("image", "vector"):
+            log("warning: a layer holds one file, so only the first one was used.")
+            files = files[:1]
 
         multi = len(files) > 1
         ico_sizes = _ico_sizes(files)
@@ -387,6 +448,9 @@ def import_media(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: L
         if cat == "video" and o["want_audio"]:
             audio_files = {f for f in files if ct.probe_has_audio(f)}
             want_audio = bool(audio_files)
+            if want_audio and not media_av.can_encode_mp3():
+                _state["warnings"].append("this device can't encode MP3, so the sound was skipped")
+                want_audio = False
 
         base = copy.deepcopy(actor)
         written: list[Path] = []
@@ -400,7 +464,7 @@ def import_media(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: L
                         d2, summary = ct.render_frames_actor(files, st, ico_sizes, fps)
             except Exception as e:
                 raise OpError(f"Could not import: {e}")
-            actor["actorBlueprint"]["components"]["Drawing2"] = d2
+            _put_drawing(actor, d2, layer)
             log(summary)
             tasks.say("Saving blueprint", 0.97)
             write_blueprint(bp_path, actor)
@@ -422,12 +486,15 @@ def import_media(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: L
             used_selected = True
             if not is_sel:
                 ct.strip_audio_rules(t_actor)
-            t_actor["actorBlueprint"]["components"]["Drawing2"] = d2
+            _put_drawing(t_actor, d2, layer if is_sel else None)
             log(summary)
             if has_aud:
                 with tasks.span(lo + (hi - lo) * 0.5, hi):
                     if not ct.attach_audio(t_actor, f, is_video=True):
                         log("warning: continuing with silent video.")
+                        why = (_state["errors"][-1] if _state["errors"] else "unknown error")
+                        why = re.sub(r"^Audio upload failed:\s*", "", why).strip().splitlines()[0][:120]
+                        _state["warnings"].append(f"the sound wasn't uploaded ({why})")
             write_blueprint(t_path, t_actor)
             if is_sel:
                 ct.maybe_delete_placeholder_script(card_dir, bp_path)
@@ -448,9 +515,11 @@ def font_charset_names() -> list[str]:
 
 
 @_guard
-def import_font(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Log) -> list[Path]:
+def import_font(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Log,
+                layer: Optional[str] = None) -> list[Path]:
     """Port of do_add_font(). opts: charsets (list of preset names) and/or
-    custom (charspec text), bitmap, scale, steps, px, smooth, color."""
+    custom (charspec text), bitmap, scale, steps, px, smooth, color.
+    layer: see import_media (one font only when a layer is targeted)."""
     bp_path, card_dir, src = Path(bp_path), Path(card_dir), Path(src)
     if not ct.HAS_FONTTOOLS:
         raise OpError("fontTools is not installed.")
@@ -496,6 +565,9 @@ def import_font(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Lo
             fonts.append((fp, font))
         if not fonts:
             raise OpError("No readable fonts.")
+        if layer is not None and len(fonts) > 1:
+            log("warning: a layer holds one font, so only the first one was used.")
+            fonts = fonts[:1]
 
         base = copy.deepcopy(actor)
         used_selected = False
@@ -537,7 +609,7 @@ def import_font(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Lo
                 continue
             t_path, t_actor, is_sel = ct.next_target(card_dir, bp_path, actor, base, used_selected, fp.stem)
             used_selected = True
-            t_actor["actorBlueprint"]["components"]["Drawing2"] = d2
+            _put_drawing(t_actor, d2, layer if is_sel else None)
             write_blueprint(t_path, t_actor)
             if missing:
                 log(f"warning: {missing} codepoint(s) have no glyph in this font and were skipped.")

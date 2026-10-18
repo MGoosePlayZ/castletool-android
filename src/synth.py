@@ -8,6 +8,9 @@ Model (what castletool writes and Castle's "tone" sampler does):
   * a step is 1/stepsPerBeat of a beat (4 per beat); tempo is the card's BPM
   * Castle's note `key` sounds one octave below the same MIDI number, which is
     why castletool adds 12 on import - so MIDI pitch = key - 12.
+  * The sampler's `midiNote` is the instrument's root note (48 = castletool's
+    default). Every track using that instrument is transposed by midiNote - 48
+    semitones, so midiNote 60 sounds one octave higher than 48.
 A tone has no sustain: it ramps up over `attack`, then dies away over `release`.
 
 Drums: song.tracks[].instrument = {type:"drums", params:{kick, snare, ...}}; notes
@@ -25,6 +28,17 @@ STEPS_PER_BEAT = 4
 
 # loudness balance between waveforms (square/saw are hotter than sine)
 WAVE_GAIN = {"sine": 0.55, "square": 0.30, "sawtooth": 0.34, "noise": 0.38}
+
+
+DEFAULT_MIDI_NOTE = 48
+
+
+def _midi_note_shift(sample: dict) -> float:
+    """Semitones the instrument's root note (`midiNote`) moves its notes from the default."""
+    try:
+        return float(sample.get("midiNote", DEFAULT_MIDI_NOTE)) - DEFAULT_MIDI_NOTE
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _freq(key: float, rate: float = 1.0) -> float:
@@ -192,6 +206,7 @@ def voices_from_music(music: dict) -> tuple[list[dict], list[str]]:
             "release": float(sample.get("release") if sample.get("release") is not None else 0.3),
             "amp": float((sample.get("amplitude") or {}).get("value", 1.0)),
             "rate": float((sample.get("playbackRate") or {}).get("value", 1.0)),
+            "shift": _midi_note_shift(sample),
             "vol": float(props.get("volume", 1.0)),
             "muted": bool(props.get("muted", False)),
         })
@@ -205,7 +220,8 @@ def note_buffer(voice: dict, key: float, sr: int, seed: int = 1337) -> np.ndarra
     dur = max(0.05, voice["attack"] + voice["release"])
     n = int(dur * sr)
     rng = np.random.default_rng(seed + int(key))
-    sig = _tone(voice["wave"], _freq(key, voice["rate"]), n, rng, sr)
+    pitch = key + voice.get("shift", 0.0)
+    sig = _tone(voice["wave"], _freq(pitch, voice["rate"]), n, rng, sr)
     sig = sig * _envelope(n, voice["attack"], voice["release"], sr)
     gain = WAVE_GAIN.get(voice["wave"], 0.4) * voice["amp"] * voice["vol"]
     return (sig * gain).astype(np.float32)

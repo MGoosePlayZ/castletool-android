@@ -1,6 +1,7 @@
 """Decks (tabs) → Deck (cards) → Card (blueprints) screens."""
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from datetime import datetime
@@ -13,7 +14,7 @@ import tasks
 import theme
 from app import App, Screen, profile_screen
 from cardbar import CardContext, card_bar, leave_card
-from deck_store import list_local_decks
+from deck_store import cauldron_status, detect_cauldron, list_local_decks
 from theme import BG, MAJOR, MINOR1, SEP, castle_icon, md_icon, minor, text
 from widgets import icon_button, pill_button
 
@@ -248,7 +249,9 @@ def deck_row(app: App, d: dict) -> ft.Control:
 # ── deck: grid of cards ────────────────────────────────────────────────────
 
 def deck_screen(app: App, deck_dir: Path) -> Screen:
-    def build(a: App) -> ft.Control:
+    state = {"alive": True}
+
+    def cards_view(a: App) -> ft.Control:
         tiles = []
         for cid in card_ids(deck_dir):
             cdir = deck_dir / "cards" / cid
@@ -267,7 +270,33 @@ def deck_screen(app: App, deck_dir: Path) -> Screen:
                                               alignment=ft.MainAxisAlignment.CENTER), padding=14)],
                          scroll=ft.ScrollMode.AUTO, expand=True)
 
-    return Screen(title="Deck", build=build)
+    def body(a: App, cauldron: bool) -> ft.Control:
+        if cauldron:        # nothing to do with the cards of a cauldron deck, so they aren't shown
+            return ft.Container(minor("This deck uses cauldron", 13), alignment=ft.Alignment.CENTER, expand=True)
+        return cards_view(a)
+
+    def build(a: App) -> ft.Control:
+        state["alive"] = True
+        known, needs_fetch = cauldron_status(a.cauldron_cache, deck_dir)
+        if known is not None or not needs_fetch:
+            return body(a, bool(known))
+        host = ft.Container(ft.ProgressRing(width=20, height=20, stroke_width=2, color=MAJOR),
+                            alignment=ft.Alignment.CENTER, expand=True)
+
+        async def check():
+            try:
+                found = await asyncio.to_thread(detect_cauldron, a.api, deck_dir, a.cauldron_cache)
+            except Exception as ex:             # offline etc.: show the cards, ask again next time
+                a.log(f"cauldron check: {ex}", 2)
+                found = False
+            if state["alive"]:
+                host.content = body(a, found)
+                a.page.update()
+
+        a.page.run_task(check)
+        return host
+
+    return Screen(title="Deck", build=build, on_leave=lambda: state.update(alive=False))
 
 
 # ── card: list of blueprints ───────────────────────────────────────────────

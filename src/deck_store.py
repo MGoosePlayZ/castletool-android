@@ -30,7 +30,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import tasks
-from castle_api import CastleAPI, CastleAPIError, UNLISTED_TEST_CONTENT_FLAGS
+from castle_api import (CastleAPI, CastleAPIError, UNLISTED_TEST_CONTENT_FLAGS, UPLOAD_LIMIT_BYTES,
+                        UploadTooLarge)
 
 Log = Callable[[str], None]
 
@@ -108,6 +109,65 @@ def _scene_properties_for_project(props):
         if isinstance(props.get("backgroundColor"), dict):
             props["backgroundColor"]["a"] = 1
     return props
+
+
+# ── cauldron decks ───────────────────────────────────────────────────────
+# A "cauldron" deck runs on the experimentalWeb engine: its scene data holds
+# {"experimentalWeb": {"enabled": true, ...}, ...}. Its cards (if any) can't be edited here.
+
+def scene_uses_cauldron(data) -> bool:
+    stack = [data]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            ew = node.get("experimentalWeb")
+            if isinstance(ew, dict) and ew.get("enabled") is True:
+                return True
+            stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+        elif isinstance(node, list):
+            stack.extend(v for v in node if isinstance(v, (dict, list)))
+    return False
+
+
+def _top_card(deck_dir: Path) -> tuple[str, str]:
+    """(cardId, sceneDataUrl) of the deck's top card, as stored in deck.json."""
+    try:
+        card = _read_json(Path(deck_dir) / "deck.json").get("initialCard") or {}
+    except (OSError, ValueError):
+        return "", ""
+    return card.get("cardId") or "", card.get("sceneDataUrl") or ""
+
+
+def _read_cauldron_cache(cache_file: Path) -> dict:
+    try:
+        data = _read_json(Path(cache_file))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def cauldron_status(cache_file: Path, deck_dir: Path) -> tuple[Optional[bool], bool]:
+    """(known answer or None, whether it still has to be fetched) without touching the network."""
+    card_id, url = _top_card(deck_dir)
+    entry = _read_cauldron_cache(cache_file).get(card_id) if card_id else None
+    if isinstance(entry, dict) and "cauldron" in entry and (not url or entry.get("url") == url):
+        return bool(entry["cauldron"]), False
+    return None, bool(card_id and url)
+
+
+def detect_cauldron(api: CastleAPI, deck_dir: Path, cache_file: Path) -> bool:
+    """Does this deck use cauldron? Only the top card's scene data is looked at; the answer is
+    cached per card (and re-fetched when the card's scene data URL changes). Blocks; raises
+    on network errors (nothing is cached then)."""
+    known, needs_fetch = cauldron_status(cache_file, deck_dir)
+    if known is not None or not needs_fetch:
+        return bool(known)
+    card_id, url = _top_card(deck_dir)
+    result = scene_uses_cauldron(api.download_scene_data(url))
+    cache = _read_cauldron_cache(cache_file)
+    cache[card_id] = {"url": url, "cauldron": result}
+    _write_json(Path(cache_file), cache)
+    return result
 
 
 def list_local_decks(root: Path) -> list[Path]:
@@ -238,6 +298,32 @@ def materialize_card(card_dir: Path) -> dict:
     return {"snapshot": snapshot}
 
 
+def deck_upload_size(deck_dir: Path) -> int:
+    """Bytes the whole deck's scene data comes to when uploaded (every project-format card)."""
+    deck_dir = Path(deck_dir)
+    deck = _read_json(deck_dir / "deck.json")
+    cards = deck.get("cards") or ([deck["initialCard"]] if deck.get("initialCard") else [])
+    total = 0
+    for card in cards:
+        card_dir = deck_dir / "cards" / (card.get("cardId") or "")
+        if not card.get("cardId") or not is_project_card_dir(card_dir):
+            continue
+        try:
+            payload = materialize_card(card_dir)
+        except FileNotFoundError:
+            continue
+        total += len(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    return total
+
+
+def assert_deck_fits(deck_dir: Path, limit: int = UPLOAD_LIMIT_BYTES) -> None:
+    """Refuse to upload a deck Castle would reject: the check covers the whole deck."""
+    size = deck_upload_size(deck_dir)
+    if size > limit:
+        raise UploadTooLarge(f"This deck is {size / 1048576:.1f} MB, over Castle's {limit // 1048576} MB "
+                             "upload limit. Remove some media and try again.")
+
+
 def _assert_card_can_be_saved(api: CastleAPI, card_id: str, deck_id: str) -> None:
     # `card` resolver errors when the row doesn't exist (new deck): treat as absent.
     try:
@@ -268,6 +354,7 @@ def push_deck(api: CastleAPI, deck_dir: Path, log: Log = print) -> str:
     cards = deck.get("cards") or ([deck["initialCard"]] if deck.get("initialCard") else [])
     if not cards:
         raise ValueError(f"No cards found in {deck_dir}.")
+    assert_deck_fits(deck_dir)
     for card in cards:
         card["cardId"] = card.get("cardId") or make_id()
         _assert_card_can_be_saved(api, card["cardId"], deck["deckId"])
@@ -355,6 +442,8 @@ def push_card(api: CastleAPI, deck_dir: Path, card_id: str, log: Log = print) ->
     card_json["title"] = card.get("title") or card_json.get("title") or f"Card {index + 1}"
     _write_json(card_json_path, card_json)
 
+    tasks.say("Checking size", 0.05)
+    assert_deck_fits(deck_dir)
     tasks.say("Preparing card", 0.1)
     scene = materialize_card(card_dir)
     tasks.say("Uploading card", 0.3)

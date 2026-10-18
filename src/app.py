@@ -136,6 +136,7 @@ class App:
         self.decks_dir = self.root / "decks"
         self.decks_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir = self.root / "cache"
+        self.cauldron_cache = self.cache_dir / "cauldron.json"      # {cardId: {url, cauldron}}
         self.session_file = self.root / "session.json"
         self.profile_file = self.root / "profile.json"
         self.avatar_file = self.root / "profile-photo.img"
@@ -171,6 +172,7 @@ class App:
     async def start(self):
         from screens_library import home_screen
         self.page.add(ft.SafeArea(self.layout, expand=True))
+        self._setup_back()
         self._load_cached_session()
         self.log(f"Castletool {theme.APP_VERSION} on {getattr(self.page.platform, 'value', self.page.platform)}", 2)
         self.push(home_screen(self))
@@ -402,7 +404,36 @@ class App:
         self._bar_sig = (id(s), s.sig(self) if s.sig else None)
         self.topbar_host.content = self._bar(s)
         self.body.content = s.build(self)
+        self._sync_back()
         self.page.update()
+
+    # ── Android back button ───────────────────────────────────────────────
+    def _root_view(self):
+        try:
+            return self.page.views[0]
+        except Exception:
+            return None
+
+    def _setup_back(self):
+        view = self._root_view()
+        if view is not None:
+            view.on_confirm_pop = self._on_confirm_pop
+
+    def _sync_back(self):
+        """On the Decks screen the back button does what the system does (minimize). On every
+        other screen (deck, card, blueprint, profile) it is intercepted and goes back a screen."""
+        view = self._root_view()
+        if view is not None:
+            want = len(self.stack) <= 1
+            if view.can_pop != want:
+                view.can_pop = want
+
+    async def _on_confirm_pop(self, e):
+        view = self._root_view()
+        if view is not None:
+            await view.confirm_pop(False)          # never let the system close the app from here
+        if len(self.stack) > 1:
+            self.go_back()                         # screens may intercept it (e.g. "Save changes?")
 
     # ── logging ───────────────────────────────────────────────────────────
     def log(self, msg: str, level: int = 1):

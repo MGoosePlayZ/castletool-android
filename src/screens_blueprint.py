@@ -12,6 +12,7 @@ import flet as ft
 import blueprint_ops as ops
 import castletool_core as ct
 import drawing
+import layers as lyr
 import live_synth
 import synth
 import tasks
@@ -19,13 +20,14 @@ import theme
 from app import Screen
 from cardbar import CardContext, card_bar
 from screens_library import card_bg
-from theme import BG, MAJOR, MINOR1, SEP, castle_icon, minor, text
+from theme import BG, MAJOR, MINOR1, SEP, castle_icon, md_icon, minor, text
 from widgets import ColorField, NumberBox, icon_button, info_note, pill_button
 
 ARCHIVES = {"zip", "tar", "gz", "tgz", "bz2", "xz", "tbz2", "txz"}
 MEDIA_EXTS = sorted({e.lstrip(".") for e in (ct.IMAGE_EXTS | ct.VIDEO_EXTS | ct.VECTOR_EXTS | ct.FONT_EXTS)} | ARCHIVES)
 AUDIO_EXTS = sorted({e.lstrip(".") for e in ct.AUDIO_EXTS} | ARCHIVES)
 FIELD_TEXT = ft.TextStyle(font_family=theme.BODY, color=MAJOR, size=14)
+LAYER_ROW_H = 48
 BLANK_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGNgYGBgAAAABQABpfZFQAAAAABJRU5ErkJggg==")
 
 
@@ -173,10 +175,97 @@ class BlueprintView:
             out.append(self.preview_block(d2))
         else:
             out.append(ft.Container(castle_icon("pencil", 30, MINOR1), height=140, alignment=ft.Alignment.CENTER))
-        out.append(ft.Container(pill_button("Upload", self.on_pick_media, castle_icon("upload", 18, BG), filled=True),
-                                margin=ft.Margin.only(top=14)))
+        out.append(ft.Row([pill_button("New Layer", lambda e: self.app.spawn(self.on_pick_layer(lyr.NEW)),
+                                       castle_icon("add", 18, BG), filled=True)],
+                          alignment=ft.MainAxisAlignment.START))
+        out.append(self.layer_list())
         out.append(self.log_box())
-        return ft.Column(out, spacing=6)
+        return ft.Column(out, spacing=10)
+
+    # ── layers ────────────────────────────────────────────────────────────
+    def layer_list(self) -> ft.Control:
+        """Top layer first (like Castle's own layer list). Hold a layer's menu icon to drag it."""
+        layers = ops.drawing_layers(self.bp)
+        if not layers:
+            return ft.Container(height=0)
+        shown = list(reversed(layers))                     # storage order is bottom → top
+        rows = [self.layer_row(l) for l in shown]
+        return ft.ReorderableListView(rows, show_default_drag_handles=False, on_reorder=self.on_reorder_layers,
+                                      height=LAYER_ROW_H * len(rows), item_extent=LAYER_ROW_H, spacing=0)
+
+    def layer_row(self, layer: dict) -> ft.Control:
+        handle = ft.ReorderableDragHandle(
+            content=ft.Container(md_icon("menu", 22, MINOR1), width=40, height=LAYER_ROW_H,
+                                 alignment=ft.Alignment.CENTER),
+            mouse_cursor=ft.MouseCursor.GRAB)
+        name = ft.Container(
+            text(layer["title"] or "Layer", 14, max_lines=1, no_wrap=True, overflow=ft.TextOverflow.FADE),
+            expand=True, height=LAYER_ROW_H, alignment=ft.Alignment.CENTER_LEFT, ink=True,
+            clip_behavior=ft.ClipBehavior.HARD_EDGE, on_click=lambda e, l=layer: self.rename_layer_dialog(l))
+        upload = icon_button(castle_icon("upload", 20), lambda e, l=layer: self.app.spawn(self.on_pick_layer(l["id"])),
+                             "Overwrite layer", size=40)
+        delete = icon_button(castle_icon("delete", 20), lambda e, l=layer: self.ask_delete_layer(l),
+                             "Delete layer", size=40)
+        return ft.Container(ft.Row([handle, name, upload, delete], spacing=0,
+                                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                            height=LAYER_ROW_H, border=ft.Border(bottom=ft.BorderSide(1, SEP)))
+
+    def edit_layers(self, fn) -> bool:
+        """Run a quick layer edit with an undo checkpoint, then redraw."""
+        try:
+            self.ctx.edit_sync(fn)
+        except ops.OpError as ex:
+            self.app.toast(str(ex), error=True)
+            return False
+        self.app.refresh()
+        return True
+
+    def on_reorder_layers(self, e):
+        n = len(ops.drawing_layers(self.bp))
+        old, new = e.old_index, e.new_index
+        if old is None or new is None or old == new:
+            return
+        # the list shows the top layer first: display index i is storage index n - 1 - i
+        if not self.edit_layers(lambda: ops.move_layer(self.bp_path, n - 1 - old, n - 1 - new)):
+            self.render()
+
+    def rename_layer_dialog(self, layer: dict):
+        field = ft.TextField(value=layer["title"], dense=True, border_color=SEP, width=260, autofocus=True,
+                             text_style=FIELD_TEXT)
+        holder: dict = {}
+
+        def save(e):
+            name = (field.value or "").strip()
+            if not name:
+                self.app.toast("A layer needs a name.", error=True)
+                return
+            self.app.close_dialog(holder["dlg"])
+            if name != layer["title"]:
+                self.edit_layers(lambda: ops.rename_layer(self.bp_path, layer["id"], name))
+
+        field.on_submit = save
+        holder["dlg"] = self.app.dialog("Rename layer", ft.Column([field], tight=True, width=260), [
+            ft.TextButton(content=text("Save", 14, MAJOR, bold=True), on_click=save)])
+
+    def ask_delete_layer(self, layer: dict):
+        self.app.confirm(f"Delete \"{layer['title'] or 'Layer'}\"?", "", "Delete",
+                         lambda: self.edit_layers(lambda: ops.delete_layer(self.bp_path, layer["id"])))
+
+    async def on_pick_layer(self, target: str):
+        """New layer (target == lyr.NEW) or overwrite one: pick a file, then the usual import dialog."""
+        path = await self.app.pick(MEDIA_EXTS, "Choose image, video, SVG, font or archive")
+        if not path:
+            return
+        info = await self.app.run(lambda: ops.inspect_media(path, log=self.app.log))
+        if not info:
+            return
+        if info["category"] == "audio":
+            self.app.toast("That's audio. Use the Audio tab.", error=True)
+            return
+        if info["unsupported"]:
+            self.app.toast(info["unsupported"], error=True)
+            return
+        ImportDialog(self, path, info, layer=target).open()
 
     def preview_block(self, d2: dict) -> ft.Control:
         info = drawing.drawing_info(d2)
@@ -228,21 +317,6 @@ class BlueprintView:
             controls.append(ft.Row([play_btn, slider, label], vertical_alignment=ft.CrossAxisAlignment.CENTER))
         return ft.Column(controls, spacing=8)
 
-    async def on_pick_media(self, e):
-        path = await self.app.pick(MEDIA_EXTS, "Choose image, video, SVG, font or archive")
-        if not path:
-            return
-        info = await self.app.run(lambda: ops.inspect_media(path, log=self.app.log))
-        if not info:
-            return
-        if info["category"] == "audio":
-            self.app.toast("That's audio. Use the Audio tab.", error=True)
-            return
-        if info["unsupported"]:
-            self.app.toast(info["unsupported"], error=True)
-            return
-        ImportDialog(self, path, info).open()
-
     # ── MUSIC ─────────────────────────────────────────────────────────────
     def _close_engine(self):
         eng, self.engine = self.engine, None
@@ -261,6 +335,7 @@ class BlueprintView:
             out.append(minor(f"{st['tracks']} track{'s' if st['tracks'] != 1 else ''} · {st['notes']:,} notes · "
                              f"{bpm:g} BPM", 12))
             out.append(self.player_controls(music, bpm))
+            out.append(info_note("Looping tracks and non-tonal samples aren't implemented"))
         else:
             out.append(ft.Container(castle_icon("music", 30, MINOR1), height=120, alignment=ft.Alignment.CENTER))
         if ct.HAS_MIDO:
@@ -381,8 +456,9 @@ class BlueprintView:
 class ImportDialog:
     """Settings for a picked media file, with a preview that follows the settings."""
 
-    def __init__(self, view: BlueprintView, path: Path, info: dict):
+    def __init__(self, view: BlueprintView, path: Path, info: dict, layer: Optional[str] = None):
         self.view, self.app, self.path, self.info = view, view.app, path, info
+        self.layer = layer                   # None: whole drawing | lyr.NEW | an existing layer's id
         self.cat = info["category"]
         self.vals: dict = {"charsets": {"ASCII"}, "quantize_on": info["size"] > 500_000}
         self.busy = False
@@ -482,11 +558,14 @@ class ImportDialog:
         if cat in ("animation", "video"):
             c.append(self.num("every", "Every Nth frame", 1, step=1, minimum=1))
         if multi and cat in ("image", "vector"):
-            c.append(self.choice("layout", "Several files", [("frames", "Frames of one actor"),
-                                                             ("separate", "Separate actors")], "frames"))
-            c.append(info_note("Every file becomes a frame of this blueprint." if
-                               self.vals.get("layout", "frames") == "frames" else
-                               "Every file becomes its own blueprint."))
+            if self.layer is None:
+                c.append(self.choice("layout", "Several files", [("frames", "Frames of one actor"),
+                                                                 ("separate", "Separate actors")], "frames"))
+                c.append(info_note("Every file becomes a frame of this blueprint." if
+                                   self.vals.get("layout", "frames") == "frames" else
+                                   "Every file becomes its own blueprint."))
+            else:
+                c.append(info_note("Every file becomes a frame of this layer."))
             if self.vals.get("layout", "frames") == "frames":
                 c.append(self.num("fps", "Frames per second", 4, step=1, minimum=1, maximum=60, decimals=1))
             if bitmap_like and cat == "image":
@@ -500,7 +579,10 @@ class ImportDialog:
             if self.vals.get("quantize_on"):
                 c.append(self.num("quantize_colors", "Colors", 256, step=8, minimum=1, maximum=256))
         if cat == "video" and info["has_audio"]:
-            c.append(self.switch("want_audio", "Sound", True))
+            if info.get("audio_unsupported"):
+                c.append(info_note("This device can't encode MP3, so this video's sound can't be uploaded."))
+            else:
+                c.append(self.switch("want_audio", "Sound", True))
         return c
 
     def font_options(self) -> list[ft.Control]:
@@ -559,7 +641,8 @@ class ImportDialog:
             "quantize": quant, "svg_style": v.get("svg_style", "vector"), "svg_scale": num("svg_scale", 1),
             "steps": num("steps", 16, int),
             "color": ops.parse_color(v.get("color", "#ffffff")) if v.get("color_on") else None,
-            "fps": num("fps", 4), "want_audio": bool(v.get("want_audio", True)),
+            "fps": num("fps", 4),
+            "want_audio": bool(v.get("want_audio", True)) and not self.info.get("audio_unsupported"),
         }
 
     # preview -------------------------------------------------------------
@@ -619,6 +702,25 @@ class ImportDialog:
             on_close=self.on_closed)
         self.schedule_preview()
 
+    async def ask_overwrite_sound(self) -> Optional[bool]:
+        """The blueprint already plays a sound: True = overwrite it, False = keep it, None = cancelled."""
+        fut = asyncio.get_running_loop().create_future()
+        holder: dict = {}
+
+        def answer(value: Optional[bool]):
+            if not fut.done():
+                fut.set_result(value)
+            self.app.close_dialog(holder["dlg"])
+
+        btn = lambda label, value: ft.TextButton(content=text(label, 14, MAJOR, bold=True),
+                                                 on_click=lambda e: answer(value))
+        holder["dlg"] = self.app.dialog(
+            "Overwrite sound?", text("This blueprint already plays a sound. Replace it with this video's sound?",
+                                     14, MINOR1),
+            [btn("Keep current", False), btn("Overwrite", True)],
+            on_close=lambda: fut.done() or fut.set_result(None))
+        return await fut
+
     async def do_import(self, e):
         if self.busy:
             return
@@ -628,17 +730,34 @@ class ImportDialog:
             self.app.toast(str(ex), error=True)
             return
         v, path, token = self.view, self.path, self.app.api.token
+        if kind == "media" and opts.get("want_audio") and self.cat == "video" and self.info.get("has_audio"):
+            v.reload()
+            if ops.audio_urls(v.bp):                    # don't silently replace a sound that's already there
+                self.busy = True
+                choice = await self.ask_overwrite_sound()
+                self.busy = False
+                if choice is None:
+                    return
+                opts["want_audio"] = choice
         self.busy = True
         self.token += 1
         self.cancel_preview()                           # free the converter before the real import
+        layer = self.layer
         if kind == "font":
-            fn = lambda task: ops.import_font(v.bp_path, v.card_dir, path, opts, log=self.app.log, token=token, task=task)
+            fn = lambda task: ops.import_font(v.bp_path, v.card_dir, path, opts, log=self.app.log, token=token,
+                                              task=task, layer=layer)
         else:
-            fn = lambda task: ops.import_media(v.bp_path, v.card_dir, path, opts, log=self.app.log, token=token, task=task)
+            fn = lambda task: ops.import_media(v.bp_path, v.card_dir, path, opts, log=self.app.log, token=token,
+                                               task=task, layer=layer)
         res = await v.ctx.edit_async("Importing", fn)
         self.busy = False
         if res:
             self.app.close_dialog(self.holder["dlg"])
-            await v.after_edit(res, "Imported." if len(res) == 1 else f"Imported {len(res)} actors.")
+            msg = "Imported." if len(res) == 1 else f"Imported {len(res)} actors."
+            problems = ops.take_warnings()
+            if problems:
+                msg = f"Imported, but {'; '.join(problems)}."
+                self.app.log("warning: " + msg)
+            await v.after_edit(res, msg)
         else:
             self.schedule_preview()                     # cancelled or failed: dialog stays, settings kept

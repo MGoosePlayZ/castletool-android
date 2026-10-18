@@ -100,6 +100,7 @@ MD = {
     "logout": 0xE9BA,
     "login": 0xEA77,
     "folder_open": 0xE2C8,
+    "menu": 0xE5D2,
 }
 
 

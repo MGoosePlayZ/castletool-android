@@ -27,14 +27,23 @@ except Exception:  # not installed / failed to load native libs
 SAMPLE_RATE = 44100
 
 
-def can_encode_mp3() -> bool:
+MP3_ENCODERS = ("libmp3lame", "libshine")     # whichever this PyAV build ships
+
+
+def _mp3_encoder() -> Optional[str]:
     if not HAS_AV:
-        return False
-    try:
-        av.codec.Codec("libmp3lame", "w")
-        return True
-    except Exception:
-        return False
+        return None
+    for name in MP3_ENCODERS:
+        try:
+            av.codec.Codec(name, "w")
+            return name
+        except Exception:
+            continue
+    return None
+
+
+def can_encode_mp3() -> bool:
+    return _mp3_encoder() is not None
 
 
 # ── video ────────────────────────────────────────────────────────────────
@@ -184,8 +193,11 @@ def _decode_pcm(path: Path):
 
 def _encode_mp3(pcm, out_path: Path, bitrate: int = 96000) -> None:
     import numpy as np
+    encoder = _mp3_encoder()
+    if not encoder:
+        raise RuntimeError("This device can't encode MP3.")
     out = av.open(str(out_path), "w", format="mp3")
-    st = out.add_stream("libmp3lame", rate=SAMPLE_RATE)
+    st = out.add_stream(encoder, rate=SAMPLE_RATE)
     st.bit_rate = bitrate
     st.layout = "stereo"
     n, step, pos = pcm.shape[1], 1152, 0

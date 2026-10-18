@@ -75,6 +75,25 @@ class CastleAPIError(Exception):
     pass
 
 
+# Castle's uploads go through AWS API Gateway, which refuses anything over 10 MB.
+UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024
+TOO_LARGE_MESSAGE = "This deck is over Castle's 10 MB upload limit. Remove some media and try again."
+
+
+class UploadTooLarge(CastleAPIError):
+    """The deck is bigger than Castle accepts in one upload."""
+
+
+def http_error_message(status: int, body: str = "") -> str:
+    """A readable message for a failed HTTP request (servers answer with whole HTML/XML pages)."""
+    text = (body or "").strip()
+    if status == 413 or "EntityTooLarge" in text or "Request Entity Too Large" in text:
+        return TOO_LARGE_MESSAGE
+    if not text or text.startswith("<") or "<html" in text[:200].lower():
+        return f"Castle returned an error (HTTP {status})."
+    return f"Castle returned HTTP {status}: {text[:200]}"
+
+
 class OfflineError(CastleAPIError):
     """Castle's servers couldn't be reached (no network / DNS / timeout)."""
 
@@ -115,8 +134,7 @@ class CastleAPI:
         try:
             body = resp.json()
         except ValueError:
-            resp.raise_for_status()
-            raise CastleAPIError(f"Non-JSON response (HTTP {resp.status_code})")
+            raise CastleAPIError(http_error_message(resp.status_code, resp.text))
 
         # GraphQL errors can ride on non-2xx too; prefer their message.
         if isinstance(body, dict):
@@ -124,7 +142,8 @@ class CastleAPI:
                 raise CastleAPIError(body["error"].get("message", str(body["error"])))
             if body.get("errors"):
                 raise CastleAPIError(body["errors"][0].get("message", str(body["errors"][0])))
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise CastleAPIError(http_error_message(resp.status_code))
         return body["data"]
 
     # ── auth ─────────────────────────────────────────────────────────────
@@ -279,7 +298,7 @@ class CastleAPI:
             timeout=120,
         )
         if r.status_code >= 300:
-            raise CastleAPIError(f"Scene data upload failed: HTTP {r.status_code} {r.text[:200]}")
+            raise CastleAPIError(http_error_message(r.status_code, r.text))
         return cfg["uploadId"]
 
     def update_card_and_deck_v2(self, deck: dict, card: dict) -> dict:
