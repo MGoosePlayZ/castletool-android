@@ -20,7 +20,7 @@ import flet as ft
 import tasks
 import theme
 from blueprint_ops import OpError
-from castle_api import CastleAPI, CastleAPIError, OfflineError
+from castle_api import CastleAPI, CastleAPIError, DeckDeleted, OfflineError
 from deck_list import list_recent_decks
 from deck_store import clone_deck, push_card, resolve_deck_ref
 from icons import IconStore
@@ -33,8 +33,9 @@ GLOBAL_MAX_AGE = 120.0   # seconds before the deck list is refreshed again
 LOG_KEEP = 3000
 LOG_LEVELS = [(0, "Errors only"), (1, "Normal"), (2, "Verbose")]
 LEVEL_NAMES = {0: "ERROR", 1: "INFO", 2: "VERBOSE"}
-DEFAULT_SETTINGS = {"dev_mode": False, "log_level": 1}
+DEFAULT_SETTINGS = {"dev_mode": False, "log_level": 1, "onboarded": False}
 _CANCELLED = object()
+_DELETED = object()          # a deck Castle no longer lets us see
 
 
 @dataclass
@@ -176,7 +177,7 @@ class App:
         self._setup_back()
         self._load_cached_session()
         self.log(f"Castletool {theme.APP_VERSION} on {getattr(self.page.platform, 'value', self.page.platform)}", 2)
-        self.push(home_screen(self))
+        self.push(signin_screen(self) if self.needs_signin_gate else home_screen(self))
         self.page.run_task(self._startup_refresh)
         missing = theme.missing_fonts() + theme.missing_icons()
         if missing:
@@ -192,6 +193,8 @@ class App:
         token = sess.get("token")
         if token:
             self.api.token = token
+            if not self.settings.get("onboarded"):          # already signed in: skip the first-run screens
+                self.set_setting("onboarded", True)
             self.user = _read_json(self.profile_file) or {"userId": None, "username": ""}
             if self.avatar_file.exists():
                 self.avatar_bytes = self.avatar_file.read_bytes()
@@ -200,6 +203,12 @@ class App:
     @property
     def signed_in(self) -> bool:
         return bool(self.api.token)
+
+    @property
+    def needs_signin_gate(self) -> bool:
+        """Until the first sign-in the app shows only the sign-in screen. After that, never again
+        (signing out later gives the normal app with 'You are not signed in')."""
+        return not self.signed_in and not self.settings.get("onboarded")
 
     def _save_session(self):
         _write_json(self.session_file, {"token": self.api.token})
@@ -337,6 +346,11 @@ class App:
                 leaving.on_leave()
             except Exception as ex:
                 self.log(f"[leave] {ex}", 2)
+        self._show()
+
+    def replace_root(self, screen: Screen):
+        """Swap the whole stack for one screen (the first-run sign-in / welcome / Decks)."""
+        self.stack = [screen]
         self._show()
 
     def go_home(self):
@@ -743,8 +757,16 @@ class App:
                 if task.cancelled:
                     return
                 if self.online:
-                    path = await self.work("Opening deck", lambda t: self.fresh_clone(deck_id, t),
-                                           task=task, view=view)
+                    def clone(t):
+                        try:
+                            return self.fresh_clone(deck_id, t)
+                        except DeckDeleted:
+                            return _DELETED
+                    path = await self.work("Opening deck", clone, task=task, view=view)
+                    if path is _DELETED:
+                        view.close()
+                        await self.deck_was_deleted(deck_id, local_dir)
+                        return
                     if path:
                         view.close()
                         self.push(deck_screen(self, path))
@@ -761,6 +783,21 @@ class App:
         finally:
             view.close()
             self.opening.discard(deck_id)
+
+    async def deck_was_deleted(self, deck_id: str, local_dir: Optional[Path]):
+        """Castle won't show us a deck we know: it was deleted there. Drop the local copy (saving it
+        would only fail) and the cached list entry, and say so."""
+        self.log(f"Deck {deck_id} is gone from Castle; removing the local copy")
+        self.global_decks = [d for d in self.global_decks if d.get("deckId") != deck_id]
+        _write_json(self.global_file, self.global_decks)
+        if local_dir and Path(local_dir).exists():
+            await self.delete_deck(Path(local_dir))
+        else:
+            self.clear_sessions(deck_id)
+            self.refresh_body_if("Decks")
+        self.dialog("This deck was deleted", ft.Container(height=0), [
+            ft.TextButton(content=text("OK", 14, MAJOR, bold=True), on_click=lambda e: self.page.pop_dialog())],
+            closable=False)
 
     def ask_delete_deck(self, deck_dir: Path, name: str):
         unsaved = deck_has_unsaved(deck_dir)
@@ -805,6 +842,96 @@ class App:
             ctx.session.mark_saved()
         self.refresh_bar()
         return bool(ok)
+
+
+# ── shared footer ───────────────────────────────────────────────────────────
+
+def footer_links(a: App) -> ft.Control:
+    """Colophon / Terms / Privacy / Github, then the unofficial-app disclaimer."""
+    def link(label: str, url: str):
+        async def go(e):
+            await a.launcher.launch_url(url)
+        return ft.Container(text(label, 13, MAJOR, medium=True), padding=ft.Padding.symmetric(vertical=8, horizontal=10),
+                            ink=True, border_radius=8, on_click=go)
+    return ft.Column([
+        ft.Row([link(l, u) for l, u in theme.CASTLE_LINKS], alignment=ft.MainAxisAlignment.CENTER, wrap=True),
+        minor(theme.DISCLAIMER, 11, text_align=ft.TextAlign.CENTER),
+    ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6)
+
+
+# ── first-run screens: sign in, then welcome ───────────────────────────────
+
+def signin_screen(app: App) -> Screen:
+    """Shown instead of Decks until the first sign-in: no top bar, nothing else reachable."""
+    user_f = ft.TextField(hint_text="Username or email", dense=True, border_color=SEP, width=280,
+                          text_style=ft.TextStyle(font_family=theme.BODY, color=MAJOR))
+    pass_f = ft.TextField(hint_text="Password", password=True, can_reveal_password=True, dense=True,
+                          border_color=SEP, width=280, text_style=ft.TextStyle(font_family=theme.BODY, color=MAJOR))
+    state = {"busy": False}
+    form = ft.Column(spacing=10, horizontal_alignment=ft.CrossAxisAlignment.CENTER)
+
+    def paint():
+        form.controls = [
+            user_f, pass_f,
+            pill_button("Sign in", on_sign_in, filled=True, busy=state["busy"], width=280),
+            pill_button("Sign in with browser", on_sign_in_browser, disabled=state["busy"], width=280),
+        ] + ([pill_button("Cancel", on_cancel, width=280)] if state["busy"] else [])
+        app.page.update()
+
+    def on_cancel(e):
+        app.login_cancel = True
+        state["busy"] = False
+        paint()
+
+    async def finish(ok: bool):
+        state["busy"] = False
+        pass_f.value = ""
+        if ok:
+            app.set_setting("onboarded", True)          # these first-run screens never come back
+            app.replace_root(welcome_screen(app))
+        else:
+            paint()
+
+    async def on_sign_in(e):
+        if not user_f.value or not pass_f.value:
+            return
+        state["busy"] = True
+        paint()
+        await finish(await app.sign_in_password(user_f.value, pass_f.value))
+
+    async def on_sign_in_browser(e):
+        state["busy"] = True
+        paint()
+        await finish(await app.sign_in_browser())
+
+    def build(a: App) -> ft.Control:
+        paint()
+        return ft.Column([
+            ft.Container(ft.Column([title("Welcome to Castletool", 28, text_align=ft.TextAlign.CENTER), form],
+                                   spacing=24, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
+                         expand=True, alignment=ft.Alignment.CENTER, padding=16),
+            ft.Container(footer_links(a), padding=ft.Padding(left=16, right=16, top=8, bottom=16)),
+        ], spacing=0, scroll=ft.ScrollMode.AUTO, horizontal_alignment=ft.CrossAxisAlignment.CENTER, expand=True)
+
+    return Screen(build=build, title="Sign in", bar=lambda a: ft.Container(height=0))
+
+
+def welcome_screen(app: App) -> Screen:
+    """'Welcome <name>', the profile picture, Continue. Shown once, right after the first sign-in."""
+    def go(e):
+        from screens_library import home_screen
+        app.replace_root(home_screen(app))
+
+    def build(a: App) -> ft.Control:
+        name = ((a.user or {}).get("username") or "").strip()
+        return ft.Container(ft.Column([
+            title(f"Welcome {name}".strip(), 28, text_align=ft.TextAlign.CENTER),
+            a.avatar(120, ring=False),
+            pill_button("Continue", go, filled=True, width=280),
+        ], spacing=24, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
+            expand=True, alignment=ft.Alignment.CENTER, padding=16)
+
+    return Screen(build=build, title="Welcome", bar=lambda a: ft.Container(height=0))
 
 
 # ── profile screen ─────────────────────────────────────────────────────────
@@ -903,17 +1030,6 @@ def profile_screen(app: App) -> Screen:
         out.append(a.log_view(240))
         return out
 
-    def links(a: App) -> ft.Control:
-        def link(label: str, url: str):
-            async def go(e):
-                await a.launcher.launch_url(url)
-            return ft.Container(text(label, 13, MAJOR, medium=True), padding=ft.Padding.symmetric(vertical=8, horizontal=10),
-                                ink=True, border_radius=8, on_click=go)
-        return ft.Column([
-            ft.Row([link(l, u) for l, u in theme.CASTLE_LINKS], alignment=ft.MainAxisAlignment.CENTER, wrap=True),
-            minor(theme.DISCLAIMER, 11, text_align=ft.TextAlign.CENTER),
-        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6)
-
     def build(a: App) -> ft.Control:
         paint()
         head = ft.Row([
@@ -926,7 +1042,7 @@ def profile_screen(app: App) -> Screen:
             theme.separator(),
             ft.Container(ft.Column(dev_section(a), spacing=10), padding=14),
             theme.separator(),
-            ft.Container(links(a), padding=ft.Padding(left=16, right=16, top=12, bottom=28)),
+            ft.Container(footer_links(a), padding=ft.Padding(left=16, right=16, top=12, bottom=28)),
         ], scroll=ft.ScrollMode.AUTO, spacing=0)
 
     return Screen(title="Profile", build=build)

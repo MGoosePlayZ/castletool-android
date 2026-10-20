@@ -94,30 +94,43 @@ def card_settings_dialog(app, ctx: CardContext):
     from screens_library import card_bg, swatch
     bg = {"v": card_bg(ctx.card_dir)}
     tempo = {"v": f"{ops.card_tempo(ctx.card_dir):g}"}
-    color = ColorField(app, bg["v"], lambda v: bg.update(v=v))
-    tempo_box = NumberBox(None, tempo["v"], lambda v: tempo.update(v=v), step=1, minimum=1, maximum=999,
-                          decimals=2, width=200)
     holder: dict = {}
 
-    def save(e):
+    def apply(quiet: bool = False) -> bool:
+        """Write the dialog's values into the card buffer (not to Castle). Does nothing when
+        nothing differs, so it is safe to call from every route that closes the dialog."""
         try:
             t = float(tempo["v"])
         except ValueError:
-            app.toast("Tempo must be a number.", error=True)
-            return
-        changed = bg["v"] != card_bg(ctx.card_dir) or abs(t - ops.card_tempo(ctx.card_dir)) > 1e-9
-        app.close_dialog(holder["dlg"])
-        if not changed:
-            return
+            if not quiet:
+                app.toast("Tempo must be a number.", error=True)
+            t = ops.card_tempo(ctx.card_dir)             # bad tempo text: keep the old tempo
+        if bg["v"] == card_bg(ctx.card_dir) and abs(t - ops.card_tempo(ctx.card_dir)) <= 1e-9:
+            return False
         try:
-            def apply():
+            def write():
                 ops.set_card_background(ctx.card_dir, bg["v"])
                 ops.set_card_tempo(ctx.card_dir, t)
-            ctx.edit_sync(apply)
+            ctx.edit_sync(write)
         except ops.OpError as ex:
             app.toast(str(ex), error=True)
-            return
+            return False
         app.refresh()
+        return True
+
+    def picked(v: str):                                  # a color change lands in the buffer at once
+        bg["v"] = v
+        apply()
+
+    color = ColorField(app, bg["v"], picked)
+    # The tempo is typed digit by digit, so it lands in the buffer when the dialog closes
+    # (OK, the X, or tapping outside), not on every keystroke.
+    tempo_box = NumberBox(None, tempo["v"], lambda v: tempo.update(v=v), step=1, minimum=1, maximum=999,
+                          decimals=2, width=200)
+
+    def ok(e):
+        app.close_dialog(holder["dlg"])
+        apply()
 
     async def pick_cover(e):
         path = await app.pick(["png", "jpg", "jpeg"], "Choose a cover image")
@@ -148,7 +161,8 @@ def card_settings_dialog(app, ctx: CardContext):
                                                   ft.Row([ft.Container(castle_icon("picture", 22, MINOR1), width=34), cover_btn],
                                                          vertical_alignment=ft.CrossAxisAlignment.CENTER)],
                                                  tight=True, spacing=14, width=280), [
-        ft.TextButton(content=text("Save", 14, MAJOR, bold=True), on_click=save)])
+        ft.TextButton(content=text("OK", 14, MAJOR, bold=True), on_click=ok)],
+        on_close=lambda: apply(quiet=True))
 
 
 async def leave_card(app, ctx: CardContext):

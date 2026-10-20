@@ -225,7 +225,8 @@ def home_screen(app: App) -> Screen:
             items = tab_decks(a, a.decks_tab)
             if not items:
                 list_host.content = ft.ListView(
-                    [ft.Container(minor("No decks", 13), alignment=ft.Alignment.CENTER, height=200),
+                    [ft.Container(minor("No decks" if a.signed_in else "You are not signed in", 13),
+                                   alignment=ft.Alignment.CENTER, height=200),
                      ft.Container(height=(a.page.height or 800))],
                     expand=True, on_scroll=on_scroll, scroll_interval=10)
                 return

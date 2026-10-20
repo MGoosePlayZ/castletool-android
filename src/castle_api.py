@@ -98,6 +98,13 @@ def http_error_message(status: int, body: str = "") -> str:
     return f"Castle returned HTTP {status}: {text[:200]}"
 
 
+class DeckDeleted(CastleAPIError):
+    """Castle says we can't view the deck. For a deck we already know, that means it was deleted."""
+
+
+DECK_GONE_MESSAGE = "permission to view this deck"
+
+
 class OfflineError(CastleAPIError):
     """Castle's servers couldn't be reached (no network / DNS / timeout)."""
 
@@ -235,7 +242,12 @@ class CastleAPI:
     # ── decks ────────────────────────────────────────────────────────────
 
     def deck(self, deck_id: str) -> Optional[dict]:
-        return self._call(DECK_QUERY, {"deckId": deck_id})["deck"]
+        try:
+            return self._call(DECK_QUERY, {"deckId": deck_id})["deck"]
+        except CastleAPIError as ex:
+            if not isinstance(ex, (OfflineError, UploadTooLarge)) and DECK_GONE_MESSAGE in str(ex).lower():
+                raise DeckDeleted(str(ex)) from ex
+            raise
 
     def decks_for_user(self, user_id: str, limit: Optional[int] = None) -> list[dict]:
         data = self._call(

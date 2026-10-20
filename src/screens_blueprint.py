@@ -21,7 +21,7 @@ from app import Screen
 from cardbar import CardContext, card_bar
 from screens_library import card_bg
 from theme import BG, MAJOR, MINOR1, SEP, castle_icon, md_icon, minor, text
-from widgets import ColorField, NumberBox, icon_button, info_note, pill_button
+from widgets import ColorField, NumberBox, contrast_bg, icon_button, info_note, pill_button
 
 ARCHIVES = {"zip", "tar", "gz", "tgz", "bz2", "xz", "tbz2", "txz"}
 MEDIA_EXTS = sorted({e.lstrip(".") for e in (ct.IMAGE_EXTS | ct.VIDEO_EXTS | ct.VECTOR_EXTS | ct.FONT_EXTS)} | ARCHIVES)
@@ -215,19 +215,35 @@ class BlueprintView:
             pending["token"] += 1
             self.app.page.run_task(debounce, pending["token"])
 
+        cur_color = ops.text_color_hex(t.get("color"))
         field = ft.TextField(value=t.get("content") or "", multiline=True, min_lines=3, max_lines=8, dense=True,
-                             border_color=SEP, text_style=FIELD_TEXT, on_change=typed, on_blur=save_content)
+                             border_color=SEP, on_change=typed, on_blur=save_content, filled=True,
+                             text_style=ft.TextStyle(font_family=theme.text_font_family(t.get("fontName")),
+                                                     color=cur_color, size=16),
+                             cursor_color=cur_color, bgcolor=contrast_bg(cur_color))
+
+        def restyle(hex_: str):
+            """The box shows the text the way it will look: its font and color, on white or black."""
+            field.text_style = ft.TextStyle(font_family=theme.text_font_family(t.get("fontName")),
+                                            color=hex_, size=16)
+            field.cursor_color = hex_
+            field.bgcolor = contrast_bg(hex_)
 
         def pick_font(name: str):
             if commit(fontName=name):
                 self.render()
 
+        # Every font at once: square buttons squashed to the text box's width, icons scaled to fit.
+        gap = 4
+        n_fonts = len(ops.TEXT_FONTS)
+        avail = (getattr(self.app.page, "width", None) or 360) - 28                    # the panel has 14px padding per side
+        icon_px = max(12.0, min(28.0, ((avail - gap * (n_fonts - 1)) / n_fonts) * 0.6))
         fonts = ft.Row([
-            ft.Container(castle_icon(icon, 28, MAJOR if name == t.get("fontName") else MINOR1),
-                         width=48, height=48, alignment=ft.Alignment.CENTER, border_radius=10, ink=True,
+            ft.Container(castle_icon(icon, icon_px, MAJOR if name == t.get("fontName") else MINOR1),
+                         expand=1, aspect_ratio=1, alignment=ft.Alignment.CENTER, border_radius=8, ink=True,
                          border=ft.Border.all(1, MAJOR if name == t.get("fontName") else SEP),
                          on_click=lambda e, n=name: pick_font(n))
-            for name, icon in ops.TEXT_FONTS], spacing=8, scroll=ft.ScrollMode.AUTO)
+            for name, icon in ops.TEXT_FONTS], spacing=gap)
 
         def align_icon(v: str, h: str, color: str) -> ft.Control:
             name = {("top", "left"): "arrow_insert", ("top", "center"): "arrow_upward",
@@ -263,8 +279,16 @@ class BlueprintView:
 
         align_btn = ft.Container(align_icon(cur_v, cur_h, MAJOR), width=48, height=48, alignment=ft.Alignment.CENTER,
                                  border_radius=10, ink=True, border=ft.Border.all(1, SEP), on_click=open_align)
-        color = ColorField(self.app, ops.text_color_hex(t.get("color")), lambda v: commit(color=v)).control
-        return ft.Column([field, fonts, ft.Row([align_btn]), color, self.log_box()], spacing=14)
+        align_row = ft.Row([align_btn, text(f"{cur_v.title()} {cur_h.title()}", 14, MAJOR)], spacing=12,
+                           vertical_alignment=ft.CrossAxisAlignment.CENTER)
+
+        def color_picked(v: str):
+            if commit(color=v):
+                restyle(v)
+                self.app.page.update()
+        color = ColorField(self.app, cur_color, color_picked).control
+        return ft.Column([field, fonts, align_row, color, self.log_box()], spacing=14,
+                         horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
 
     # ── layers ────────────────────────────────────────────────────────────
     def layer_list(self) -> ft.Control:

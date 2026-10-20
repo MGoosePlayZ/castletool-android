@@ -140,6 +140,15 @@ def norm_hex(value: str, default: str = "#000000") -> str:
     return "#" + t.lower() if re.fullmatch(r"[0-9a-fA-F]{6}", t) else default
 
 
+def contrast_bg(color: str) -> str:
+    """White or black, whichever a text of `color` reads best on (WCAG relative luminance)."""
+    c = norm_hex(color)
+    lin = [((v / 255) / 12.92) if (v / 255) <= 0.03928 else (((v / 255) + 0.055) / 1.055) ** 2.4
+           for v in (int(c[i:i + 2], 16) for i in (1, 3, 5))]
+    lum = 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+    return "#ffffff" if lum < 0.179 else "#000000"
+
+
 class ColorField:
     """Swatch with the hex number to its right. Tap for a picker.
     `enabled=False` grays it out and ignores taps."""
@@ -275,7 +284,7 @@ def open_color_picker(app, current: str, on_pick: Callable[[str], None]):
 
     # ── top row: close (left) + square swatch (right) ──
     swatch = ft.Container(width=36, height=36, border_radius=6, bgcolor=hex_now(), border=ft.Border.all(1, SEP))
-    close = icon_button(castle_icon("close", 22), lambda e: app.page.pop_dialog(), size=36)
+    close = icon_button(castle_icon("close", 22), lambda e: ok(e), size=36)     # X applies the color too
 
     # ── wheel ──
     ring_img = ft.Image(src=hue_ring_png(), width=WHEEL, height=WHEEL, fit=ft.BoxFit.CONTAIN,

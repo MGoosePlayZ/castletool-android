@@ -33,6 +33,11 @@ FONT_FILES = {
 BODY = "DMSans"
 TITLE = "Basteleur"
 
+# Castle's text-actor fonts. Drop the files into assets/fonts/ named exactly <name>.ttf (or .otf):
+# Bore, CourierPrime, Glacier, HelicoCentrica, Piazzolla, Synco, Tektur, YatraOne.
+# (DMSans is already bundled.) Optional: a missing one just falls back to DMSans.
+TEXT_FONT_NAMES = ("Bore", "CourierPrime", "Glacier", "HelicoCentrica", "Piazzolla", "Synco", "Tektur", "YatraOne")
+
 
 ICON_FILES = ("icons/key-info.png", "icons/default-profile.png")
 
@@ -51,10 +56,30 @@ def missing_fonts() -> list[str]:
     return [rel for rel in FONT_FILES.values() if not (ASSETS / rel).exists()]
 
 
+def text_font_files() -> dict[str, str]:
+    """Castle text fonts found in assets/fonts (.ttf or .otf). Without assets/ on disk
+    (can't check) the .ttf names are assumed."""
+    out: dict[str, str] = {}
+    for name in TEXT_FONT_NAMES:
+        for ext in (".ttf", ".otf"):
+            rel = f"fonts/{name}{ext}"
+            if not ASSETS.exists() or (ASSETS / rel).exists():
+                out[name] = rel
+                break
+    return out
+
+
 def font_map() -> dict[str, str]:
     """Fonts to register with the page: only ones that exist."""
     gone = set(missing_fonts())
-    return {fam: rel for fam, rel in FONT_FILES.items() if rel not in gone}
+    return {**{fam: rel for fam, rel in FONT_FILES.items() if rel not in gone}, **text_font_files()}
+
+
+def text_font_family(name: str | None) -> str:
+    """UI font family that draws a Castle fontName; DMSans when that font isn't bundled."""
+    if name == "DMSans" or name in text_font_files():
+        return name
+    return BODY
 
 
 # ── Castle icon font ─────────────────────────────────────────────────────
