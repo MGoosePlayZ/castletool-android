@@ -101,6 +101,14 @@ MD = {
     "login": 0xEA77,
     "folder_open": 0xE2C8,
     "menu": 0xE5D2,
+    # text-actor alignment grid
+    "arrow_insert": 0xF837,
+    "arrow_upward": 0xE5D8,
+    "arrow_outward": 0xF8CE,
+    "arrow_back": 0xE5C4,
+    "center_focus_weak": 0xE3B5,
+    "arrow_forward": 0xE5C8,
+    "arrow_downward": 0xE5DB,
 }
 
 

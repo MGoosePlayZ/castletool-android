@@ -142,29 +142,77 @@ def step_seconds(bpm: float) -> float:
     return 60.0 / (max(1.0, bpm) * STEPS_PER_BEAT)
 
 
+LOOP_GRID = 16                  # looping patterns repeat on a 16-step grid
+MAX_LOOP_NOTES = 200_000        # safety valve for absurdly long loops
+
+
+def pattern_length(pat: dict) -> int:
+    """Steps one repeat of a looping pattern lasts: its last note's step, rounded up to a
+    multiple of 16 (at least 16). Notes may run past 16; the repeat just gets longer."""
+    last = -1.0
+    for step_key in (pat.get("notes") or {}):
+        try:
+            last = max(last, float(step_key))
+        except ValueError:
+            pass
+    bars = max(1, math.ceil((last + 1) / LOOP_GRID))
+    return bars * LOOP_GRID
+
+
+def _clips(track: dict, patterns: dict) -> list:
+    """[(start_step, pattern, loops)] of one track, in time order."""
+    out = []
+    for start_key, ref in (track.get("sequence") or {}).items():
+        pat = patterns.get((ref or {}).get("patternId"))
+        if not pat:
+            continue
+        try:
+            start = float(start_key)
+        except ValueError:
+            continue
+        out.append((start, pat, bool((ref or {}).get("loop"))))
+    out.sort(key=lambda c: c[0])
+    return out
+
+
 def collect_notes(music: dict, bpm: float) -> list[dict]:
-    """Flatten the song into [{t, key, vel, track}] (seconds)."""
+    """Flatten the song into [{t, key, vel, track}] (seconds).
+
+    A clip with `loop: true` plays its pattern, then keeps repeating it (every
+    pattern_length() steps) until the next clip of the same track starts. A clip that
+    is directly followed by another one therefore never repeats. A looping clip with
+    nothing after it repeats until the song's end: the end of the longest clip in the song.
+    """
     song = (music or {}).get("song") or {}
     patterns = song.get("patterns") or {}
     sec = step_seconds(bpm)
+    tracks = [_clips(t, patterns) for t in (song.get("tracks") or [])]
+    song_end = max((start + pattern_length(pat) for clips in tracks for start, pat, _ in clips), default=0.0)
     out = []
-    for ti, track in enumerate(song.get("tracks") or []):
-        for start_key, ref in (track.get("sequence") or {}).items():
-            pat = patterns.get((ref or {}).get("patternId"))
-            if not pat:
-                continue
+
+    def emit(ti: int, pat: dict, at: float, until: float = float("inf")):
+        for step_key, notes in (pat.get("notes") or {}).items():
             try:
-                start = float(start_key)
+                step = float(step_key)
             except ValueError:
                 continue
-            for step_key, notes in (pat.get("notes") or {}).items():
-                try:
-                    step = float(step_key)
-                except ValueError:
-                    continue
-                for nt in notes or []:
-                    out.append({"t": (start + step) * sec, "key": nt.get("key", 60),
-                                "vel": nt.get("vel", 100), "track": ti})
+            if at + step >= until:                # the next clip has taken over
+                continue
+            for nt in notes or []:
+                out.append({"t": (at + step) * sec, "key": nt.get("key", 60),
+                            "vel": nt.get("vel", 100), "track": ti})
+
+    for ti, clips in enumerate(tracks):
+        for ci, (start, pat, loops) in enumerate(clips):
+            emit(ti, pat, start)
+            if not loops:
+                continue
+            length = pattern_length(pat)
+            limit = clips[ci + 1][0] if ci + 1 < len(clips) else song_end
+            at = start + length
+            while at < limit and len(out) < MAX_LOOP_NOTES:
+                emit(ti, pat, at, limit)
+                at += length
     out.sort(key=lambda n: n["t"])
     return out
 

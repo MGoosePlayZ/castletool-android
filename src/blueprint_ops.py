@@ -626,6 +626,54 @@ def import_font(bp_path: Path, card_dir: Path, src: Path, opts: dict, *, log: Lo
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+# ── text actors ──────────────────────────────────────────────────────────
+
+# Text.fontName -> CASTLE icon (the "Ab" glyph Castle shows for that font).
+# "DMSans" is the font Castle's picker shows with the Overlay icon.
+TEXT_FONTS = [
+    ("Bore", "font_bore"), ("CourierPrime", "font_courier_prime"), ("Glacier", "font_glacier"),
+    ("HelicoCentrica", "font_helico_centrica"), ("DMSans", "font_overlay"), ("Piazzolla", "font_piazzolla"),
+    ("Synco", "font_synco"), ("Tektur", "font_tektur"), ("YatraOne", "font_yatra_one"),
+]
+TEXT_H_ALIGN = ("left", "center", "right")
+TEXT_V_ALIGN = ("top", "middle", "bottom")
+
+
+def text_component(bp: dict) -> Optional[dict]:
+    """The blueprint's Text component when it is an active text actor, else None."""
+    t = components(bp).get("Text")
+    return t if isinstance(t, dict) and not t.get("disabled") else None
+
+
+def text_color_hex(color) -> str:
+    try:
+        return "#%02x%02x%02x" % tuple(max(0, min(255, round(float(color[k]) * 255))) for k in "rgb")
+    except (TypeError, KeyError, ValueError):
+        return "#ffffff"
+
+
+def set_text_props(bp_path: Path, **props) -> None:
+    """Change content / fontName / alignment / verticalAlignment / color of a text actor."""
+    bp = load_blueprint(bp_path)
+    t = text_component(bp)
+    if t is None:
+        raise OpError("This blueprint isn't a text actor.")
+    if "fontName" in props and props["fontName"] not in {n for n, _ in TEXT_FONTS}:
+        raise OpError("Unknown font.")
+    if "alignment" in props and props["alignment"] not in TEXT_H_ALIGN:
+        raise OpError("Unknown alignment.")
+    if "verticalAlignment" in props and props["verticalAlignment"] not in TEXT_V_ALIGN:
+        raise OpError("Unknown alignment.")
+    if "color" in props:                                  # hex -> {r,g,b,a}, keeping the alpha
+        rgba = parse_color(props.pop("color"))
+        if not rgba:
+            raise OpError("Unknown color.")
+        a = (t.get("color") or {}).get("a", 1)
+        t["color"] = {"r": rgba[0], "g": rgba[1], "b": rgba[2], "a": a}
+    t.update(props)
+    write_blueprint(bp_path, bp)
+
+
 # ── MIDI → Music ─────────────────────────────────────────────────────────
 
 @_guard

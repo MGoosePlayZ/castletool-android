@@ -92,7 +92,8 @@ class BlueprintView:
         self.anim_token += 1                       # stops any running preview animation / song
         self._close_engine()
         self.app.log_targets.clear()
-        panel = {"media": self.media_panel, "music": self.music_panel, "audio": self.audio_panel}[self.tab]()
+        media = self.text_panel if ops.text_component(self.bp) else self.media_panel
+        panel = {"media": media, "music": self.music_panel, "audio": self.audio_panel}[self.tab]()
         self.root.controls = [self.header(), self.tabs(), ft.Container(panel, padding=14)]
         if update:
             self.app.page.update()
@@ -181,6 +182,89 @@ class BlueprintView:
         out.append(self.layer_list())
         out.append(self.log_box())
         return ft.Column(out, spacing=10)
+
+    # ── text actor ────────────────────────────────────────────────────────
+    def text_panel(self) -> ft.Control:
+        """Replaces the Media tab for text actors: content, font, alignment, color."""
+        t = ops.text_component(self.bp) or {}
+        pending = {"token": 0}
+
+        def commit(**props):
+            """Quiet save (no redraw, so the keyboard stays up)."""
+            try:
+                self.ctx.edit_sync(lambda: ops.set_text_props(self.bp_path, **props))
+            except ops.OpError as ex:
+                self.app.toast(str(ex), error=True)
+                return False
+            self.reload()
+            self.app.refresh_bar()
+            return True
+
+        def save_content(e=None):
+            pending["token"] += 1
+            value = field.value or ""
+            if value != ((ops.text_component(self.bp) or {}).get("content") or ""):
+                commit(content=value)
+
+        async def debounce(token: int):
+            await asyncio.sleep(0.8)
+            if token == pending["token"] and self.alive:
+                save_content()
+
+        def typed(e):
+            pending["token"] += 1
+            self.app.page.run_task(debounce, pending["token"])
+
+        field = ft.TextField(value=t.get("content") or "", multiline=True, min_lines=3, max_lines=8, dense=True,
+                             border_color=SEP, text_style=FIELD_TEXT, on_change=typed, on_blur=save_content)
+
+        def pick_font(name: str):
+            if commit(fontName=name):
+                self.render()
+
+        fonts = ft.Row([
+            ft.Container(castle_icon(icon, 28, MAJOR if name == t.get("fontName") else MINOR1),
+                         width=48, height=48, alignment=ft.Alignment.CENTER, border_radius=10, ink=True,
+                         border=ft.Border.all(1, MAJOR if name == t.get("fontName") else SEP),
+                         on_click=lambda e, n=name: pick_font(n))
+            for name, icon in ops.TEXT_FONTS], spacing=8, scroll=ft.ScrollMode.AUTO)
+
+        def align_icon(v: str, h: str, color: str) -> ft.Control:
+            name = {("top", "left"): "arrow_insert", ("top", "center"): "arrow_upward",
+                    ("top", "right"): "arrow_outward", ("middle", "left"): "arrow_back",
+                    ("middle", "center"): "center_focus_weak", ("middle", "right"): "arrow_forward",
+                    ("bottom", "left"): "arrow_insert", ("bottom", "center"): "arrow_downward",
+                    ("bottom", "right"): "arrow_outward"}[(v, h)]
+            icon = md_icon(name, 26, color)
+            if (v, h) in (("bottom", "left"), ("bottom", "right")):      # mirrored upside down
+                return ft.Container(icon, scale=ft.Scale(scale_y=-1))
+            return icon
+
+        cur_h = t.get("alignment") if t.get("alignment") in ops.TEXT_H_ALIGN else "center"
+        cur_v = t.get("verticalAlignment") if t.get("verticalAlignment") in ops.TEXT_V_ALIGN else "top"
+
+        def open_align(e):
+            holder: dict = {}
+
+            def choose(v: str, h: str):
+                self.app.close_dialog(holder["dlg"])
+                if commit(alignment=h, verticalAlignment=v):
+                    self.render()
+
+            def cell(v: str, h: str):
+                on = (v, h) == (cur_v, cur_h)
+                return ft.Container(align_icon(v, h, MAJOR if on else MINOR1), width=56, height=56,
+                                    alignment=ft.Alignment.CENTER, border_radius=10, ink=True,
+                                    border=ft.Border.all(1, MAJOR if on else SEP),
+                                    on_click=lambda e, v=v, h=h: choose(v, h))
+            grid = ft.Column([ft.Row([cell(v, h) for h in ops.TEXT_H_ALIGN], spacing=8, tight=True)
+                              for v in ops.TEXT_V_ALIGN], spacing=8, tight=True)
+            holder["dlg"] = self.app.dialog(None, grid, [])
+
+        align_btn = ft.Container(align_icon(cur_v, cur_h, MAJOR), width=48, height=48, alignment=ft.Alignment.CENTER,
+                                 border_radius=10, ink=True, border=ft.Border.all(1, SEP), on_click=open_align)
+        color = ColorField(self.app, ops.text_color_hex(t.get("color")), lambda v: commit(color=v)).control
+        return ft.Column([field, fonts, ft.Row([align_btn]), color, self.log_box()], spacing=14)
 
     # ── layers ────────────────────────────────────────────────────────────
     def layer_list(self) -> ft.Control:
@@ -277,20 +361,21 @@ class BlueprintView:
             slider = ft.Slider(min=1, max=n, divisions=n - 1, value=1, expand=True, active_color=MAJOR,
                                inactive_color=SEP, label="{value}")
             label = minor(f"1 / {n}", 12, width=56, text_align=ft.TextAlign.RIGHT)
-            state = {"playing": info["play_mode"] != "still", "frames": None, "i": 0}
+            state = {"playing": info["play_mode"] != "still", "frames": None, "i": 0, "n": n}
             token = self.anim_token
             play_btn = icon_button(castle_icon("pause" if state["playing"] else "play", 22), None, size=36)
 
             def show(i: int):
-                if state["frames"]:
-                    img.src = state["frames"][i]
-                    label.value = f"{i + 1} / {n}"
+                frames = state["frames"]
+                if frames:
+                    i = state["i"] = max(0, min(i, len(frames) - 1))   # never past what was rendered
+                    img.src = frames[i]
+                    label.value = f"{i + 1} / {state['n']}"
                     slider.value = i + 1
                     self.app.page.update()
 
             def on_slide(e):
-                state["i"] = int(e.control.value) - 1
-                show(state["i"])
+                show(int(e.control.value) - 1)
 
             def toggle(e):
                 state["playing"] = not state["playing"]
@@ -306,6 +391,11 @@ class BlueprintView:
                 if token != self.anim_token or not frames:
                     return
                 state["frames"] = frames
+                if len(frames) != state["n"]:             # render is capped: the slider must match it
+                    state["n"] = len(frames)
+                    slider.max = max(2, len(frames))
+                    slider.divisions = max(1, len(frames) - 1)
+                    slider.value = min(slider.value, len(frames))
                 delay = 1.0 / max(1.0, min(60.0, float(info["fps"] or 4)))
                 while token == self.anim_token and self.alive:
                     if state["playing"]:
@@ -335,7 +425,7 @@ class BlueprintView:
             out.append(minor(f"{st['tracks']} track{'s' if st['tracks'] != 1 else ''} · {st['notes']:,} notes · "
                              f"{bpm:g} BPM", 12))
             out.append(self.player_controls(music, bpm))
-            out.append(info_note("Looping tracks and non-tonal samples aren't implemented"))
+            out.append(info_note("Non-tonal samples aren't implemented"))
         else:
             out.append(ft.Container(castle_icon("music", 30, MINOR1), height=120, alignment=ft.Alignment.CENTER))
         if ct.HAS_MIDO:

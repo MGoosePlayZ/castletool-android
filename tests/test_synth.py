@@ -72,3 +72,28 @@ em = mido.MidiFile(ticks_per_beat=480); et = mido.MidiTrack(); em.tracks.append(
 et.append(mido.Message("note_on", note=56, velocity=100, channel=9, time=0))
 assert ct.build_music(em)["song"]["tracks"] == []
 print("drums ok")
+
+# ── looping patterns ──
+def _loop_music(tracks):
+    return {"song": {"patterns": {
+        "a": {"notes": {f"{i}.000000": [{"key": 48 + i}] for i in range(16)}},                  # exactly 16 steps
+        "b": {"notes": {"3.000000": [{"key": 62}], "29.000000": [{"key": 60}]}},                # runs to step 29 -> 32
+    }, "tracks": tracks}}
+
+def _count(notes, track): return sum(1 for n in notes if n["track"] == track)
+
+assert synth.pattern_length({"notes": {"15.0": []}}) == 16 and synth.pattern_length({"notes": {"16.0": []}}) == 32
+assert synth.pattern_length({"notes": {"29.000000": []}}) == 32 and synth.pattern_length({"notes": {}}) == 16
+# open-ended loops fill up to the end of the longest clip (b = 32 steps): a plays twice, b once
+m = _loop_music([{"sequence": {"0.000000": {"patternId": "b", "loop": True}}},
+                 {"sequence": {"0.000000": {"patternId": "a", "loop": True}}}])
+ns = synth.collect_notes(m, 120); assert _count(ns, 0) == 2 and _count(ns, 1) == 32, (_count(ns, 0), _count(ns, 1))
+# no loop flag: plays once
+m["song"]["tracks"][1]["sequence"]["0.000000"]["loop"] = False
+assert _count(synth.collect_notes(m, 120), 1) == 16
+# a following clip stops the loop (and a clip right after the pattern means no repeat at all)
+m = _loop_music([{"sequence": {"0.000000": {"patternId": "a", "loop": True}, "40.000000": {"patternId": "b"}}}])
+ns = synth.collect_notes(m, 120); assert len(ns) == 16 + 16 + 8 + 2, len(ns)       # 0-15, 16-31, 32-39 cut at 40, then b
+m = _loop_music([{"sequence": {"0.000000": {"patternId": "a", "loop": True}, "16.000000": {"patternId": "b"}}}])
+assert len(synth.collect_notes(m, 120)) == 16 + 2
+print("loops ok")

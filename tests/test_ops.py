@@ -98,3 +98,25 @@ with tempfile.TemporaryDirectory() as t:
     assert dj["initialCard"]["backgroundColor"] == "#ff8800" and dj["cards"][0]["backgroundColor"] == "#ff8800"
     assert json.loads((card / "card.json").read_text())["sceneProperties"]["backgroundColor"]["r"] == 1
 print("ops ok")
+
+# ── text actors ──
+import json as _json, tempfile as _tf
+from pathlib import Path as _P
+_tp = _P(_tf.mkdtemp()) / "t.json"
+_tp.write_text(_json.dumps({"actorBlueprint": {"components": {"Text": {
+    "content": "hi", "fontName": "DMSans", "alignment": "center", "verticalAlignment": "top",
+    "color": {"r": 1, "g": 0, "b": 0, "a": 0.5}, "disabled": False}}}}))
+_bp = ops.load_blueprint(_tp)
+assert ops.text_component(_bp) and ops.text_color_hex(_bp["actorBlueprint"]["components"]["Text"]["color"]) == "#ff0000"
+ops.set_text_props(_tp, content="yo", fontName="Tektur", alignment="right", verticalAlignment="bottom", color="#00ff00")
+_t = ops.load_blueprint(_tp)["actorBlueprint"]["components"]["Text"]
+assert (_t["content"], _t["fontName"], _t["alignment"], _t["verticalAlignment"]) == ("yo", "Tektur", "right", "bottom")
+assert _t["color"] == {"r": 0, "g": 1, "b": 0, "a": 0.5}
+for bad in ({"fontName": "Comic"}, {"alignment": "up"}, {"verticalAlignment": "left"}):
+    try:
+        ops.set_text_props(_tp, **bad); raise SystemExit("accepted " + str(bad))
+    except ops.OpError:
+        pass
+_bp["actorBlueprint"]["components"]["Text"]["disabled"] = True
+assert ops.text_component(_bp) is None
+print("text ops ok")

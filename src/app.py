@@ -605,7 +605,11 @@ class App:
             bgcolor=BG, shape=theme.popup_shape(),
             title=ft.Row(head, spacing=6, vertical_alignment=ft.CrossAxisAlignment.CENTER) if head else None,
             title_padding=ft.Padding(left=10, top=10, right=16, bottom=0), content=content,
-            actions=actions or [], on_dismiss=(lambda e: on_close()) if on_close else None)
+            # Flutter's defaults leave ~24px under the content (and a gap for an empty action row)
+            content_padding=ft.Padding(left=24, top=12, right=24, bottom=8 if actions else 16),
+            actions=actions or [],
+            actions_padding=ft.Padding(left=8, top=0, right=8, bottom=8) if actions else ft.Padding.all(0),
+            on_dismiss=(lambda e: on_close()) if on_close else None)
         holder["dlg"] = dlg
         self.page.show_dialog(dlg)
         return dlg

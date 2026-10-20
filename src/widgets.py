@@ -172,7 +172,7 @@ WHEEL = 240            # picker square
 RING = 24              # hue ring thickness
 DIAMOND = 120          # side of the (rotated) saturation/value square
 KNOB = 24              # slider knob diameter
-TRACK_W = 200          # slider track width
+TRACK_W = 156          # slider track width (label 14 + track + knob + readout 34 + gaps must fit WHEEL + 16)
 
 
 def _upd(control) -> None:

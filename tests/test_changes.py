@@ -203,5 +203,14 @@ def walk(x):
     for k in ("controls", "content"):
         v = getattr(x, k, None)
         for y in (v if isinstance(v, list) else [v] if v is not None else []): walk(y)
-walk(mv.root); assert "Looping tracks and non-tonal samples aren't implemented" in texts; mv.dispose()
+walk(mv.root); assert "Non-tonal samples aren't implemented" in texts; mv.dispose()
+# text actor: the Media tab is replaced by the text editor (content field, 9 font icons, alignment, color)
+tb = c / "scene/blueprints/label.json"
+tb.write_text(_j.dumps({"entryId": "x", "title": "Label", "entryType": "actorBlueprint", "actorBlueprint": {"components": {
+    "Text": {"content": "hello", "fontName": "DMSans", "alignment": "center", "verticalAlignment": "top",
+             "color": {"r": 1, "g": 1, "b": 1, "a": 1}, "disabled": False}}}}))
+tv = sb.BlueprintView(app, ctx, tb); tv.tab = "media"; tv.render(update=False)
+texts.clear(); walk(tv.root)
+assert "New Layer" not in texts and sum(1 for t in texts if t and ord(t[0]) in range(0xE929, 0xE932)) == 9, texts
+tv.dispose()
 print("changes ok")

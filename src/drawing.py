@@ -105,14 +105,22 @@ def _decode_png(b64: str) -> Optional[Image.Image]:
         return None
 
 
+def resolve_linked(frames: list, index: int) -> int:
+    """Looping frames (`isLinked`) look exactly like the frame before them, so follow
+    the chain back to the frame that actually holds the drawing."""
+    while index > 0 and (frames[index] or {}).get("isLinked"):
+        index -= 1
+    return index
+
+
 def _frame_items(d2: dict, index: int):
-    """Yield (layer_kind, frame_dict) for every visible layer at frame `index`."""
+    """Yield the frame dict of every visible layer at frame `index` (linked frames resolved)."""
     for layer in (d2.get("drawData") or {}).get("layers") or []:
         if layer.get("isVisible") is False:
             continue
         frames = layer.get("frames") or []
         if 0 <= index < len(frames):
-            yield frames[index]
+            yield frames[resolve_linked(frames, index)]
 
 
 def _scene_bounds(d2: dict, indices) -> Optional[tuple]:

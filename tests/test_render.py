@@ -53,3 +53,14 @@ wm = np.zeros((512, 512), bool); wm[bx[1]:bx[3], bx[0]:bx[2]] = np.asarray(W) > 
 cover = (vec & binary_dilation(wm, iterations=3)).sum() / vec.sum()
 assert cover > 0.97, cover
 print("arc coverage ok", round(cover, 3))
+
+# ── looping (linked) frames look like the frame before them ──
+import drawing as _dr
+_seg = {"p": [-3, -3, 3, 3], "c": [1, 1, 1, 1]}
+_d2 = {"drawData": {"fillPixelsPerUnit": 25.6, "layers": [{"id": "l", "isVisible": True, "frames": [
+    {"isLinked": False, "pathDataList": [_seg]}, {"isLinked": True, "pathDataList": []},
+    {"isLinked": True, "pathDataList": []}, {"isLinked": False, "pathDataList": []}]}]}}
+_a, _b, _c, _e = (_dr.render_frame(_d2, i, 32).tobytes() for i in range(4))
+assert _a == _b == _c and _a != _e
+assert _dr.resolve_linked(_d2["drawData"]["layers"][0]["frames"], 2) == 0
+print("linked frames ok")
