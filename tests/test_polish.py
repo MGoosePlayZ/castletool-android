@@ -51,12 +51,9 @@ async def go():
     assert await app.sign_in_password("goose", "pw")
 asyncio.run(go())
 app.set_setting("onboarded", True)
-app.replace_root(appmod.welcome_screen(app))
-assert app.stack[-1].title == "Welcome" and app.settings["onboarded"] is True
-welcome = app.stack[-1].build(app)
-assert welcome.content.controls[0].value == "Welcome goose" and welcome.content.controls[2].content is not None
-welcome.content.controls[2].on_click(None)                         # Continue → Decks
-assert len(app.stack) == 1 and app.stack[0].title == "Decks"
+from screens_library import home_screen
+app.replace_root(home_screen(app))                                 # sign-in goes straight to Decks
+assert len(app.stack) == 1 and app.stack[0].title == "Decks" and app.settings["onboarded"] is True
 app.api.token = None; app.user = None                              # signed out later: no gate, normal app
 assert not app.needs_signin_gate
 assert json.loads((tmp / "settings.json").read_text())["onboarded"] is True

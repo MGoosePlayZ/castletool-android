@@ -859,7 +859,7 @@ def footer_links(a: App) -> ft.Control:
     ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=6)
 
 
-# ── first-run screens: sign in, then welcome ───────────────────────────────
+# ── first-run screen: sign in ───────────────────────────────────────────────
 
 def signin_screen(app: App) -> Screen:
     """Shown instead of Decks until the first sign-in: no top bar, nothing else reachable."""
@@ -874,7 +874,7 @@ def signin_screen(app: App) -> Screen:
         form.controls = [
             user_f, pass_f,
             pill_button("Sign in", on_sign_in, filled=True, busy=state["busy"], width=280),
-            pill_button("Sign in with browser", on_sign_in_browser, disabled=state["busy"], width=280),
+            pill_button("Sign in with Castle", on_sign_in_browser, disabled=state["busy"], width=280),
         ] + ([pill_button("Cancel", on_cancel, width=280)] if state["busy"] else [])
         app.page.update()
 
@@ -888,7 +888,8 @@ def signin_screen(app: App) -> Screen:
         pass_f.value = ""
         if ok:
             app.set_setting("onboarded", True)          # these first-run screens never come back
-            app.replace_root(welcome_screen(app))
+            from screens_library import home_screen
+            app.replace_root(home_screen(app))
         else:
             paint()
 
@@ -906,32 +907,16 @@ def signin_screen(app: App) -> Screen:
 
     def build(a: App) -> ft.Control:
         paint()
+        # Scroll lives on the inner column: expand inside a scrolling parent gets unbounded height and
+        # collapses to the top. Inner expand + center keeps the form centered; scroll covers the keyboard.
         return ft.Column([
-            ft.Container(ft.Column([title("Welcome to Castletool", 28, text_align=ft.TextAlign.CENTER), form],
-                                   spacing=24, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
-                         expand=True, alignment=ft.Alignment.CENTER, padding=16),
+            ft.Column([title("Welcome to Castletool!", 28, text_align=ft.TextAlign.CENTER), form],
+                      spacing=24, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                      alignment=ft.MainAxisAlignment.CENTER, scroll=ft.ScrollMode.AUTO, expand=True),
             ft.Container(footer_links(a), padding=ft.Padding(left=16, right=16, top=8, bottom=16)),
-        ], spacing=0, scroll=ft.ScrollMode.AUTO, horizontal_alignment=ft.CrossAxisAlignment.CENTER, expand=True)
+        ], spacing=0, horizontal_alignment=ft.CrossAxisAlignment.CENTER, expand=True)
 
     return Screen(build=build, title="Sign in", bar=lambda a: ft.Container(height=0))
-
-
-def welcome_screen(app: App) -> Screen:
-    """'Welcome <name>', the profile picture, Continue. Shown once, right after the first sign-in."""
-    def go(e):
-        from screens_library import home_screen
-        app.replace_root(home_screen(app))
-
-    def build(a: App) -> ft.Control:
-        name = ((a.user or {}).get("username") or "").strip()
-        return ft.Container(ft.Column([
-            title(f"Welcome {name}".strip(), 28, text_align=ft.TextAlign.CENTER),
-            a.avatar(120, ring=False),
-            pill_button("Continue", go, filled=True, width=280),
-        ], spacing=24, horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True),
-            expand=True, alignment=ft.Alignment.CENTER, padding=16)
-
-    return Screen(build=build, title="Welcome", bar=lambda a: ft.Container(height=0))
 
 
 # ── profile screen ─────────────────────────────────────────────────────────
@@ -960,7 +945,7 @@ def profile_screen(app: App) -> Screen:
             form.controls = [
                 user_f, pass_f,
                 pill_button("Sign in", on_sign_in, filled=True, busy=state["busy"], width=280),
-                pill_button("Sign in with browser", on_sign_in_browser, disabled=state["busy"], width=280),
+                pill_button("Sign in with Castle", on_sign_in_browser, disabled=state["busy"], width=280),
             ] + ([pill_button("Cancel", on_cancel_login, width=280)] if state["busy"] else [])
         app.page.update()
 
