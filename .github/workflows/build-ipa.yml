@@ -1,0 +1,34 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ipa:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync deps
+        run: |
+          uv python install 3.14
+          uv sync --python 3.14
+
+      - name: Build IPA
+        run: |
+          uv run flet build ipa \
+            --build-number ${{ github.run_number }} \
+            --ios-export-method ad-hoc
+        # Signing needs an Apple Developer account. Add the flags
+        # --ios-signing-certificate and --ios-provisioning-profile, loaded
+        # from secrets, or the build fails at the signing step.
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v7
+        with:
+          name: ipa
+          path: build/ipa/*.ipa
+          if-no-files-found: error
