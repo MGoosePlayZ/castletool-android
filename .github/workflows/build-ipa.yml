@@ -1,6 +1,8 @@
 name: Build IPA
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -12,23 +14,18 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v6
 
-      - name: Sync deps
-        run: |
-          uv python install 3.14
-          uv sync --python 3.14
-
       - name: Build IPA
-        run: |
-          uv run flet build ipa \
-            --build-number ${{ github.run_number }} \
-            --ios-export-method ad-hoc
-        # Signing needs an Apple Developer account. Add the flags
-        # --ios-signing-certificate and --ios-provisioning-profile, loaded
-        # from secrets, or the build fails at the signing step.
+        id: build
+        uses: flet-dev/flet-build-action@v1
+        with:
+          target: ipa
+          runner-python-version: "3.14"
+          bundled-python-version: "3.14"
+          build-number: ${{ github.run_number }}
 
       - name: Upload IPA
         uses: actions/upload-artifact@v7
         with:
-          name: ipa
-          path: build/ipa/*.ipa
+          path: ${{ steps.build.outputs.archive-path }}
+          archive: false
           if-no-files-found: error
