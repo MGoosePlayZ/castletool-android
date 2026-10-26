@@ -2882,6 +2882,24 @@ def do_add_audio(bp_path: Path, actor: dict, card: Path):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+def open_midi(midi_path):
+    """Open a MIDI file. Files named like `song.mid.smf` are normal MIDI files, so they get the
+    plain .mid treatment first; only when that fails are they read as a Standard MIDI File that
+    carries something in front of its `MThd` header (a RIFF/RMID wrapper, say)."""
+    try:
+        return mido.MidiFile(midi_path, clip=True)
+    except Exception as first:
+        try:
+            data = Path(midi_path).read_bytes()
+        except OSError:
+            raise first
+        start = data.find(b"MThd")
+        if start <= 0:
+            raise first
+        import io
+        return mido.MidiFile(file=io.BytesIO(data[start:]), clip=True)
+
+
 def do_add_midi(bp_path: Path, actor: dict, card: Path):
     while True:
         raw = ask_path("Enter your MIDI file path")
@@ -2892,7 +2910,7 @@ def do_add_midi(bp_path: Path, actor: dict, card: Path):
 
     p()
     pb(f"Loading MIDI: {midi_path.name}")
-    mid = mido.MidiFile(midi_path, clip=True)
+    mid = open_midi(midi_path)
     music = build_music(mid)
     pat_count = len(music["song"]["patterns"])
     trk_count = len(music["song"]["tracks"])

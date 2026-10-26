@@ -310,11 +310,13 @@ class BlueprintView:
             text(layer["title"] or "Layer", 14, max_lines=1, no_wrap=True, overflow=ft.TextOverflow.FADE),
             expand=True, height=LAYER_ROW_H, alignment=ft.Alignment.CENTER_LEFT, ink=True,
             clip_behavior=ft.ClipBehavior.HARD_EDGE, on_click=lambda e, l=layer: self.rename_layer_dialog(l))
+        export = icon_button(castle_icon("download2", 20), lambda e, l=layer: self.app.spawn(self.on_export_layer(l)),
+                             "Export layer", size=40)
         upload = icon_button(castle_icon("upload", 20), lambda e, l=layer: self.app.spawn(self.on_pick_layer(l["id"])),
                              "Overwrite layer", size=40)
         delete = icon_button(castle_icon("delete", 20), lambda e, l=layer: self.ask_delete_layer(l),
                              "Delete layer", size=40)
-        return ft.Container(ft.Row([handle, name, upload, delete], spacing=0,
+        return ft.Container(ft.Row([handle, name, export, upload, delete], spacing=0,
                                    vertical_alignment=ft.CrossAxisAlignment.CENTER),
                             height=LAYER_ROW_H, border=ft.Border(bottom=ft.BorderSide(1, SEP)))
 
@@ -358,6 +360,27 @@ class BlueprintView:
     def ask_delete_layer(self, layer: dict):
         self.app.confirm(f"Delete \"{layer['title'] or 'Layer'}\"?", "", "Delete",
                          lambda: self.edit_layers(lambda: ops.delete_layer(self.bp_path, layer["id"])))
+
+    async def on_export_layer(self, layer: dict):
+        """Save one layer as a PNG (an APNG when the drawing has several frames)."""
+        d2 = drawing.get_drawing2(self.bp)
+        if not d2:
+            self.app.toast("This blueprint has no drawing.", error=True)
+            return
+
+        def render():
+            try:
+                return drawing.export_layer(d2, layer["id"])
+            except drawing.ExportError as ex:
+                raise ops.OpError(str(ex))
+
+        res = await self.app.run(render)
+        if not res:
+            return
+        data, frames = res
+        base = re.sub(r'[\\/:*?"<>|]+', "_", f"{self.name}-{layer['title'] or 'Layer'}").strip() or "layer"
+        if await self.app.save_bytes(f"{base}.png", data, "png", "Export layer"):
+            self.app.toast(f"Exported {frames} frames as APNG." if frames > 1 else "Exported PNG.")
 
     async def on_pick_layer(self, target: str):
         """New layer (target == lyr.NEW) or overwrite one: pick a file, then the usual import dialog."""
@@ -527,7 +550,7 @@ class BlueprintView:
         return row
 
     async def on_pick_midi(self, e):
-        path = await self.app.pick(["mid", "midi"], "Choose a MIDI file")
+        path = await self.app.pick(["mid", "midi", "smf"], "Choose a MIDI file")
         if not path:
             return
         res = await self.ctx.edit_async("Importing MIDI", lambda task: ops.import_midi(
@@ -664,7 +687,15 @@ class ImportDialog:
         bitmap_like = not vector or self.vals.get("svg_style") == "bitmap"
         if vector:
             c.append(self.choice("svg_style", "Draw as", [("vector", "Vector"), ("bitmap", "Bitmap")], "vector"))
-        c.append(self.num("scale" if bitmap_like else "svg_scale", "Scale", 1, step=0.1, minimum=0.01, decimals=2))
+        fixed_px = bitmap_like and bool(self.vals.get("fixed_px", False))
+        if not (fixed_px and not vector):
+            c.append(self.num("scale" if bitmap_like else "svg_scale", "Scale", 1, step=0.1, minimum=0.01, decimals=2))
+        if bitmap_like:
+            c.append(self.switch("fixed_px", "Fixed Pixel Size", False, rebuild=True))
+            if fixed_px:
+                c.append(self.num("pixel_size", "Pixel size (Castle units)", 0.1, step=0.05, minimum=0.001, decimals=3))
+                c.append(info_note("Every pixel is drawn this wide and never resampled. Adding to a drawing that has "
+                                   "another pixel size resizes the new image to match it."))
         if not bitmap_like:
             c.append(self.num("steps", "Curve steps", 16, step=1, minimum=2, maximum=64))
         if bitmap_like:
@@ -756,6 +787,7 @@ class ImportDialog:
             "steps": num("steps", 16, int),
             "color": ops.parse_color(v.get("color", "#ffffff")) if v.get("color_on") else None,
             "fps": num("fps", 4),
+            "fixed_px": bool(v.get("fixed_px")), "pixel_size": num("pixel_size", 0.1),
             "want_audio": bool(v.get("want_audio", True)) and not self.info.get("audio_unsupported"),
         }
 

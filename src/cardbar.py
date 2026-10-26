@@ -2,6 +2,7 @@
 screen, plus the card context they share."""
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -12,7 +13,8 @@ import deck_store
 import tasks
 import theme
 from session import CardSession
-from theme import BG, DANGER, MAJOR, MINOR1, SEP, castle_icon, text
+from castle_api import UPLOAD_LIMIT_BYTES
+from theme import BG, DANGER, MAJOR, MINOR1, SEP, WARN, castle_icon, text
 from widgets import ColorField, NumberBox, icon_button, pill_button
 
 SIDE = 88   # width of the left/right slots, so the centre cluster is truly centred
@@ -29,9 +31,29 @@ class CardContext:
         self.session: CardSession = app.session_for(self.deck_dir, card_id)
         self.saving = False
 
+    def size_bytes(self) -> int:
+        """Bytes of this card's scene data as Castle receives it (what its 10 MB limit measures).
+        Rebuilt only when a file in the card's folder changed."""
+        stamp = []
+        for root, _dirs, files in os.walk(self.card_dir):
+            for name in files:
+                try:
+                    st = os.stat(os.path.join(root, name))
+                except OSError:
+                    continue
+                stamp.append((root, name, st.st_mtime_ns, st.st_size))
+        stamp = tuple(sorted(stamp))
+        if getattr(self, "_size_stamp", None) != stamp:
+            try:
+                self._size_bytes = deck_store.card_upload_size(self.card_dir)
+            except (OSError, ValueError):
+                self._size_bytes = 0
+            self._size_stamp = stamp
+        return self._size_bytes
+
     def bar_sig(self):
         s = self.session
-        return (s.can_undo, s.can_redo, s.dirty, self.saving)
+        return (s.can_undo, s.can_redo, s.dirty, self.saving, self.size_bytes())
 
     def edit_sync(self, fn: Callable[[], object]):
         self.session.checkpoint()
@@ -56,6 +78,20 @@ class CardContext:
         return result
 
 
+def size_meter(ctx: CardContext) -> ft.Control:
+    """How full the card is against Castle's 10 MB limit: white under 50%, yellow over 50%, red over 75%."""
+    size = ctx.size_bytes()
+    frac = size / UPLOAD_LIMIT_BYTES
+    pct = round(frac * 100)
+    color = DANGER if frac > 0.75 else WARN if frac > 0.5 else MAJOR
+    label = f"{size / 1048576:.2f} MB of {UPLOAD_LIMIT_BYTES // 1048576} MB"
+    ring = ft.ProgressRing(value=min(1.0, frac), width=32, height=32, stroke_width=3, color=color, bgcolor=SEP)
+    num = ft.Container(text(f"{min(pct, 999)}%", 8 if pct > 99 else 9, color, bold=True), width=32, height=32,
+                       alignment=ft.Alignment.CENTER)
+    return ft.Container(ft.Stack([ring, num], width=32, height=32), width=36, height=40,
+                        alignment=ft.Alignment.CENTER, tooltip=label)
+
+
 def card_bar(app, ctx: CardContext, mode: str) -> ft.Control:
     """mode: 'card' | 'blueprint'"""
     s = ctx.session
@@ -74,6 +110,7 @@ def card_bar(app, ctx: CardContext, mode: str) -> ft.Control:
             app.refresh()
 
     center = ft.Row([
+        size_meter(ctx),
         icon_button(castle_icon("undo", 22), undo, "Undo", disabled=not s.can_undo),
         icon_button(castle_icon("redo", 22), redo, "Redo", disabled=not s.can_redo),
         icon_button(castle_icon("settings", 22), lambda e: card_settings_dialog(app, ctx), "Card settings"),

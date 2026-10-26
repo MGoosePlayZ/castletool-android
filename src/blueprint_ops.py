@@ -214,6 +214,8 @@ DEFAULT_MEDIA_OPTS = {
     "fallback_color": None,
     "fps": 4.0,               # frame-per-file layouts
     "want_audio": True,       # videos: upload sound
+    "fixed_px": False,        # Fixed Pixel Size: every image pixel is `pixel_size` Castle units wide, never resampled
+    "pixel_size": 0.1,
 }
 
 
@@ -244,8 +246,13 @@ SVG_UNITS_PER_EM = 10.0
 
 def _media_state(o: dict, cat: str, files, ico_sizes: dict, multi: bool) -> dict:
     bitmap = cat == "vector" and o["svg_style"] == "bitmap"
+    fixed_px = bool(o.get("fixed_px")) and (cat != "vector" or bitmap) and cat not in ("audio", "font")
+    pixel_size = float(o.get("pixel_size") or 0)
+    if fixed_px and not pixel_size > 0:
+        raise OpError("Pixel size must be greater than 0.")
     st = {
-        "scale": float(o["scale"]) if (cat != "vector" or bitmap) else 1.0,
+        # Fixed Pixel Size keeps pictures at their own pixel size (a vector drawn as bitmap is still rasterized at its Scale)
+        "scale": (1.0 if fixed_px and cat != "vector" else float(o["scale"])) if (cat != "vector" or bitmap) else 1.0,
         "every": max(1, int(o["every"])),
         "quantize": int(o["quantize"] or 0),
         "svg_scale": float(o["svg_scale"]) * SVG_UNITS_PER_EM,
@@ -254,7 +261,8 @@ def _media_state(o: dict, cat: str, files, ico_sizes: dict, multi: bool) -> dict
         "smooth": bool(o["smooth"]),
         "bitmap": bitmap,
         "fallback_color": o["fallback_color"],
-        "no_scale": bool(o["no_scale"]) and multi and cat in ("image", "vector") and (cat == "image" or bitmap),
+        # several pictures of different sizes keep their own sizes, so they all end up with the same pixel size
+        "no_scale": (bool(o["no_scale"]) or fixed_px) and multi and cat in ("image", "vector") and (cat == "image" or bitmap),
         "fixed_scale": None,
     }
     if st["scale"] <= 0 or float(o["svg_scale"]) <= 0:
@@ -264,6 +272,8 @@ def _media_state(o: dict, cat: str, files, ico_sizes: dict, multi: bool) -> dict
             st["fallback_color"] = [0, 0, 0, 1]  # castletool asks; default to black
     if st["no_scale"]:
         st["fixed_scale"] = ct.fixed_density_scale(files, ico_sizes, cat, st["scale"])
+    if fixed_px:
+        st["fixed_scale"] = 1.0 / pixel_size               # pixels per Castle unit
     return st
 
 
@@ -685,7 +695,7 @@ def import_midi(bp_path: Path, card_dir: Path, midi_path: Path, *, log: Log) -> 
     if not midi_path.exists():
         raise OpError(f"File not found: {midi_path}")
     try:
-        mid = ct.mido.MidiFile(midi_path, clip=True)
+        mid = ct.open_midi(midi_path)
     except Exception as e:
         raise OpError(f"Could not read MIDI: {e}")
     with tasks.span(0.0, 0.95):

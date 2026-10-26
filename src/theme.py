@@ -186,6 +186,7 @@ def popup_shape(radius: float = 14) -> ft.RoundedRectangleBorder:
 
 # ── extras ───────────────────────────────────────────────────────────────
 DANGER = "#F87171"       # discard / destructive text
+WARN = "#FACC15"         # card size meter: over half of the upload limit
 APP_VERSION = "0.5.0"
 CASTLE_LINKS = [
     ("Colophon", "https://castle.xyz/colophon"),

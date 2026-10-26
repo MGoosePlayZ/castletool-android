@@ -522,6 +522,22 @@ class App:
             except OSError:
                 self.toast(f"Couldn't save logs: {ex}", error=True)
 
+    async def save_bytes(self, name: str, data: bytes, ext: str, title: str = "Save file") -> bool:
+        """Let the person choose where `data` goes (the system save dialog). True when it was saved."""
+        try:
+            path = await self.picker.save_file(dialog_title=title, file_name=name,
+                                               file_type=ft.FilePickerFileType.CUSTOM, allowed_extensions=[ext],
+                                               src_bytes=data)
+            if not path:
+                return False
+            if self.page.platform not in (ft.PagePlatform.ANDROID, ft.PagePlatform.IOS):
+                Path(path).write_bytes(data)           # desktop: the picker only returns the path
+            return True
+        except Exception as ex:
+            self.log(f"error: couldn't save {name}: {ex}")
+            self.toast(f"Couldn't save {name}: {ex}", error=True)
+            return False
+
     # ── helpers ───────────────────────────────────────────────────────────
     def spawn(self, awaitable):
         async def runner():

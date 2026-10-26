@@ -234,5 +234,92 @@ def render_animation(d2: dict, size: int = 256, bg=None, max_frames: int = 240, 
     return out
 
 
+class ExportError(Exception):
+    """Something the person should read."""
+
+
+VECTOR_PX_PER_UNIT = 32       # vector-only layers have no pixel grid of their own
+MAX_EXPORT_PIXELS = 64_000_000
+
+
+def export_layer(d2: dict, layer_id: str, cancel=None) -> tuple[bytes, int]:
+    """One layer as a PNG, or as an APNG (looping at the drawing's FPS) when the drawing has
+    several frames. Bitmap pixels are kept 1:1; the canvas is the union of every frame so an
+    APNG lines up. Returns (png_bytes, frame_count)."""
+    draw = d2.get("drawData") or {}
+    layer = next((l for l in draw.get("layers") or [] if l.get("id") == layer_id), None)
+    if layer is None:
+        raise ExportError("That layer no longer exists.")
+    n = len(draw.get("framesBounds") or [])
+    for l in draw.get("layers") or []:
+        n = max(n, len(l.get("frames") or []))
+    n = max(1, n)
+    ppu = float(draw.get("fillPixelsPerUnit") or 1) or 1.0
+    own = layer.get("frames") or []
+    frames = []
+    for i in range(n):
+        j = min(i, len(own) - 1)
+        frames.append(own[resolve_linked(own, j)] or {} if j >= 0 else {})
+    has_bitmap = any(f.get("fillPng") for f in frames)
+    k = ppu if has_bitmap else float(VECTOR_PX_PER_UNIT)          # output pixels per Castle unit
+    half = STROKE_UNITS * k / 2
+    xs, ys = [], []
+    for f in frames:
+        if f.get("fillPng"):
+            b = f.get("fillImageBounds") or {}
+            xs += [b.get("minX", 0) * k / ppu, b.get("maxX", 0) * k / ppu]
+            ys += [b.get("minY", 0) * k / ppu, b.get("maxY", 0) * k / ppu]
+        for seg in f.get("pathDataList") or []:
+            for (px, py) in segment_points(seg):
+                xs += [px * k - half, px * k + half]
+                ys += [py * k - half, py * k + half]
+    if not xs or max(xs) <= min(xs) or max(ys) <= min(ys):
+        raise ExportError("This layer is empty. Nothing to export.")
+    ox, oy = math.floor(min(xs)), math.floor(min(ys))
+    w, h = max(1, math.ceil(max(xs)) - ox), max(1, math.ceil(max(ys)) - oy)
+    if w * h > MAX_EXPORT_PIXELS:
+        raise ExportError(f"This layer is too large to export ({w}\u00d7{h}px).")
+    out = []
+    for f in frames:
+        if cancel and cancel():
+            raise ExportError("Cancelled.")
+        img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        if f.get("fillPng"):
+            src = _decode_png(f["fillPng"])
+            b = f.get("fillImageBounds") or {}
+            if src is not None:
+                bx, by = (b.get("minX", 0) * k / ppu) - ox, (b.get("minY", 0) * k / ppu) - oy
+                bw = max(1, round((b.get("maxX", 0) - b.get("minX", 0)) * k / ppu))
+                bh = max(1, round((b.get("maxY", 0) - b.get("minY", 0)) * k / ppu))
+                _paste_clipped(img, src.resize((bw, bh), Image.NEAREST), round(bx), round(by))
+        segs = f.get("pathDataList") or []
+        if segs:
+            layer_img = Image.new("RGBA", (w * SS, h * SS), (0, 0, 0, 0))
+            dr = ImageDraw.Draw(layer_img)
+            width = max(1.0, STROKE_UNITS * k * SS)
+            r = width / 2
+            for seg in segs:
+                pts = segment_points(seg)
+                if len(pts) < 2:
+                    continue
+                c = seg.get("c") or [0, 0, 0, 1]
+                col = tuple(max(0, min(255, round(v * 255))) for v in c[:3]) + \
+                    (max(0, min(255, round((c[3] if len(c) > 3 else 1) * 255))),)
+                xy = [((x * k - ox) * SS, (y * k - oy) * SS) for x, y in pts]
+                dr.line(xy, fill=col, width=round(width), joint="curve")
+                for (x, y) in (xy[0], xy[-1]):
+                    dr.ellipse([x - r, y - r, x + r, y + r], fill=col)
+            img.alpha_composite(layer_img.resize((w, h), Image.LANCZOS))
+        out.append(img)
+    buf = io.BytesIO()
+    if len(out) == 1:
+        out[0].save(buf, format="PNG")
+    else:
+        fps = float(d2.get("framesPerSecond") or 4) or 4.0
+        out[0].save(buf, format="PNG", save_all=True, append_images=out[1:], loop=0,
+                    duration=max(1, round(1000 / max(0.01, min(60.0, fps)))), disposal=0, blend=0)
+    return buf.getvalue(), len(out)
+
+
 def b64(png: bytes) -> str:
     return base64.b64encode(png).decode("ascii")
