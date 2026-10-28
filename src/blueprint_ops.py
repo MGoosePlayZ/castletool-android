@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import io
+import wave
 import json
 import re
 import shutil
@@ -21,6 +22,7 @@ from typing import Callable, Optional
 
 import castletool_core as ct
 import drawing
+import live_synth
 import layers as lyr
 import media_av
 import tasks
@@ -774,6 +776,79 @@ def import_audio(bp_path: Path, card_dir: Path, src: Path, *, log: Log) -> list[
         if not written:
             raise OpError("Nothing was added (see log).")
         return written
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── Music → Sound / MP3 ──────────────────────────────────────────────────
+
+def has_music(bp: dict) -> bool:
+    music = components(bp).get("Music")
+    return bool(music) and bool(((music.get("song") or {}).get("tracks")))
+
+
+def _render_music_wav(music: dict, bpm: float, out: Path) -> float:
+    """Render `music` to a mono 16-bit WAV at `out`. Returns seconds. Raises OpError if silent."""
+    pcm = live_synth.render_pcm(music, bpm, media_av.SAMPLE_RATE)
+    if not len(pcm):
+        raise OpError("This music has no notes to render.")
+    with wave.open(str(out), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(media_av.SAMPLE_RATE)
+        w.writeframes(pcm.tobytes())
+    return len(pcm) / media_av.SAMPLE_RATE
+
+
+@_guard
+def export_music_mp3(bp_path: Path, card_dir: Path, *, log: Log) -> bytes:
+    """Render the blueprint's Music to one MP3 (no 30 s limit) and return its bytes."""
+    if not media_av.can_encode_mp3():
+        raise OpError("This device can't encode MP3.")
+    actor = load_blueprint(bp_path)
+    music = components(actor).get("Music")
+    if not music:
+        raise OpError("This blueprint has no music.")
+    tmp = Path(tempfile.mkdtemp(prefix="castletool-music-"))
+    try:
+        tasks.say("Rendering music", 0.0)
+        secs = _render_music_wav(music, card_tempo(card_dir), tmp / "music.wav")
+        tasks.say("Encoding MP3", 0.5)
+        ct.extract_audio_mp3(tmp / "music.wav", tmp / "music.mp3")
+        log(f"Music rendered: {secs:.1f}s")
+        return (tmp / "music.mp3").read_bytes()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+@_guard
+def music_to_sound(bp_path: Path, card_dir: Path, *, log: Log) -> None:
+    """Render Music → MP3 → upload to Castle as the blueprint's sound (replacing any existing
+    sound rule), then delete the Music component. Nothing changes if the upload fails."""
+    if not _state["token"]:
+        raise OpError("Sign in first: sound is uploaded to Castle.")
+    if not media_av.can_encode_mp3():
+        raise OpError("This device can't encode MP3.")
+    bp_path, card_dir = Path(bp_path), Path(card_dir)
+    actor = load_blueprint(bp_path)
+    comps = ensure_components(actor)
+    music = comps.get("Music")
+    if not music:
+        raise OpError("This blueprint has no music.")
+    tmp = Path(tempfile.mkdtemp(prefix="castletool-music-"))
+    try:
+        tasks.say("Rendering music", 0.0)
+        with tasks.span(0.0, 0.2):
+            secs = _render_music_wav(music, card_tempo(card_dir), tmp / "music.wav")
+        log(f"Music rendered: {secs:.1f}s")
+        with tasks.span(0.2, 1.0):
+            ok = ct.attach_audio(actor, tmp / "music.wav", is_video=False)
+        if not ok:
+            why = (_state["errors"][-1] if _state["errors"] else "unknown error")
+            raise OpError(f"Sound upload failed: {why}")
+        comps.pop("Music", None)
+        write_blueprint(bp_path, actor)
+        log("Music replaced by sound.")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

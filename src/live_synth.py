@@ -296,3 +296,16 @@ class LiveSynth:
             self._playing = False
         finally:
             sink.close()
+
+
+def render_pcm(music: dict, bpm: float, sr: int = 44100) -> np.ndarray:
+    """Whole song mixed offline with the same voices and limiter as live playback.
+    Returns int16 mono. Empty array when the song has no audible notes."""
+    eng = LiveSynth(music, bpm, lambda: None, sr=sr)
+    if not eng.total:
+        return np.zeros(0, dtype="<i2")
+    out = np.zeros(eng.total, dtype="<i2")
+    for pos in range(0, eng.total, BLOCK * 16):
+        n = min(BLOCK * 16, eng.total - pos)
+        out[pos:pos + n] = (eng.render(pos, n) * 32767).astype("<i2")
+    return out

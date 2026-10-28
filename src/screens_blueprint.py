@@ -478,6 +478,12 @@ class BlueprintView:
         if ct.HAS_MIDO:
             out.append(ft.Container(pill_button("Upload", self.on_pick_midi, castle_icon("upload", 18, BG), filled=True,
                                                 busy=self.busy), margin=ft.Margin.only(top=14)))
+        if music and ops.has_music(self.bp):
+            out.append(ft.Row([
+                pill_button("Download MP3", lambda e: self.app.spawn(self.on_download_music()),
+                            castle_icon("download2", 18), busy=self.busy),
+                pill_button("Music to Sound", lambda e: self.ask_music_to_sound(), busy=self.busy),
+            ], spacing=8, wrap=True))
         out.append(self.log_box())
         return ft.Column(out, spacing=8)
 
@@ -556,6 +562,40 @@ class BlueprintView:
         res = await self.ctx.edit_async("Importing MIDI", lambda task: ops.import_midi(
             self.bp_path, self.card_dir, path, log=self.app.log, task=task))
         await self.after_edit(res, "MIDI imported.")
+
+    async def on_download_music(self):
+        """Render the Music to one MP3 and let the person save it."""
+        data = await self.app.run(lambda: ops.export_music_mp3(self.bp_path, self.card_dir, log=self.app.log))
+        if not data:
+            return
+        base = re.sub(r'[\\/:*?"<>|]+', "_", f"{self.name}-music").strip() or "music"
+        if await self.app.save_bytes(f"{base}.mp3", data, "mp3", "Download music"):
+            self.app.toast("Saved MP3.")
+
+    def ask_music_to_sound(self):
+        lines = ["The music is rendered to an MP3 and uploaded to Castle as this blueprint's sound. "
+                 "The music data is deleted in favor of the sound data, so it can't be edited or played "
+                 "as music afterwards."]
+        if ops.audio_urls(self.bp):
+            lines.append("This blueprint already has a sound uploaded. It will be overwritten.")
+        holder: dict = {}
+
+        def go(e):
+            self.app.close_dialog(holder["dlg"])
+            self.app.spawn(self.on_music_to_sound())
+
+        holder["dlg"] = self.app.dialog(
+            "Convert Music to Sound?", ft.Column([text(l, 14, MINOR1) for l in lines], spacing=10, tight=True, width=300),
+            [ft.TextButton(content=text("Convert", 14, MAJOR, bold=True), on_click=go)])
+
+    async def on_music_to_sound(self):
+        if not await self.app.ensure_online():
+            return
+        self._close_engine()
+        token = self.app.api.token
+        res = await self.ctx.edit_async("Converting music", lambda task: ops.music_to_sound(
+            self.bp_path, self.card_dir, log=self.app.log, token=token, task=task) or True)
+        await self.after_edit(res, "Music converted to sound.")
 
     # ── AUDIO ─────────────────────────────────────────────────────────────
     def audio_panel(self) -> ft.Control:
