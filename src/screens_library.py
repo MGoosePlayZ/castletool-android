@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -159,6 +160,8 @@ def clone_dialog(app: App):
 
 ROW_H = 72          # approximate height of one deck row (for the pull-to-refresh spacer)
 PULL_TRIGGER = 80   # overscroll pixels that start a refresh
+LOAD_MORE_AT = 400  # pixels from the end of the list at which the next page of decks loads
+LOAD_MORE_RETRY = 8.0   # seconds to wait after a page failed to load
 
 
 def home_screen(app: App) -> Screen:
@@ -173,7 +176,7 @@ def home_screen(app: App) -> Screen:
 
     def build(a: App) -> ft.Control:
         a.spawn(a.refresh_global())
-        st = {"pull": 0.0, "busy": False}
+        st: dict = {"pull": 0.0, "busy": False, "loader": None, "lv": None, "hold_until": 0.0}
         tab_row = ft.Row(spacing=0)
         list_host = ft.Container(expand=True)
         spinner = ft.Container(ft.ProgressRing(width=20, height=20, stroke_width=2, color=MAJOR), height=36,
@@ -189,6 +192,7 @@ def home_screen(app: App) -> Screen:
                     paint_tabs()
                     fill_list()
                     a.page.update()
+                    check_fill()
                 tabs.append(ft.Container(
                     text(t, 11, MAJOR if sel else MINOR1, bold=sel, no_wrap=True), expand=True,
                     alignment=ft.Alignment.CENTER, padding=ft.Padding.symmetric(vertical=10, horizontal=1),
@@ -210,6 +214,31 @@ def home_screen(app: App) -> Screen:
             spinner.visible = False
             st["busy"] = False
             a.page.update()
+            check_fill()
+
+        def can_more() -> bool:
+            return (a.signed_in and a.decks_tab != "LOCAL" and a.global_more and not a.global_loading
+                    and time.monotonic() >= st["hold_until"])          # a failed page waits a few seconds before the next try
+
+        async def load_more():
+            """The next page of Castle's decks, added to the end of the list (the scroll position stays)."""
+            if not can_more():
+                return
+            if st["loader"] is not None:
+                st["loader"].visible = True
+                a.page.update()
+            ok = await a.load_more_global()
+            if not ok:
+                st["hold_until"] = time.monotonic() + LOAD_MORE_RETRY
+            fill_list(keep_scroll=True)
+            a.page.update()
+            if ok:
+                check_fill()
+
+        def check_fill():
+            """A short list (or a tab that shows few of the loaded decks) can't be scrolled to its end: keep loading."""
+            if can_more() and len(tab_decks(a, a.decks_tab)) * ROW_H < (a.page.height or 800) - 120:
+                a.spawn(load_more())
 
         def on_scroll(e):
             kind = getattr(e.event_type, "value", e.event_type)
@@ -220,10 +249,13 @@ def home_screen(app: App) -> Screen:
                     a.spawn(do_refresh())
             elif kind in ("start", "end"):
                 st["pull"] = 0.0
+            if kind in ("update", "end") and e.max_scroll_extent - e.pixels < LOAD_MORE_AT and can_more():
+                a.spawn(load_more())
 
-        def fill_list():
+        def fill_list(keep_scroll: bool = False):
             items = tab_decks(a, a.decks_tab)
             if not items:
+                st["loader"] = st["lv"] = None
                 list_host.content = ft.ListView(
                     [ft.Container(minor("No decks" if a.signed_in else "You are not signed in", 13),
                                    alignment=ft.Alignment.CENTER, height=200),
@@ -232,11 +264,18 @@ def home_screen(app: App) -> Screen:
                 return
             # a spacer keeps the list scrollable even when it is short, so pulling down always works
             spacer = max(0, (a.page.height or 800) - len(items) * ROW_H - 120)
-            list_host.content = ft.ListView([deck_row(a, d) for d in items] + [ft.Container(height=spacer + 2)],
-                                            spacing=0, expand=True, on_scroll=on_scroll, scroll_interval=10)
+            loader = ft.Container(ft.ProgressRing(width=20, height=20, stroke_width=2, color=MAJOR), height=36,
+                                  alignment=ft.Alignment.CENTER, visible=a.global_loading and a.decks_tab != "LOCAL")
+            st["loader"] = loader
+            rows = [deck_row(a, d) for d in items] + [loader, ft.Container(height=spacer + 2)]
+            if keep_scroll and st["lv"] is not None and list_host.content is st["lv"]:
+                st["lv"].controls = rows                    # same ListView: the scroll position stays where it was
+            else:
+                st["lv"] = list_host.content = ft.ListView(rows, spacing=0, expand=True, on_scroll=on_scroll, scroll_interval=10)
 
         paint_tabs()
         fill_list()
+        check_fill()
         return ft.Column([tab_row, spinner, list_host], spacing=0, expand=True)
 
     return Screen(title="Decks", build=build, left=left, actions=actions, sig=bar_sig)

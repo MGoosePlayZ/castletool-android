@@ -6,7 +6,7 @@ from typing import Optional
 
 from castle_api import CastleAPI, CastleAPIError
 
-DEFAULT_LIMIT = 20
+DEFAULT_LIMIT = 20       # `castle list`'s default (the app asks for pages of its own)
 
 
 def _format_date(value) -> str:

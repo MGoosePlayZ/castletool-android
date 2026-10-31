@@ -28,7 +28,7 @@ from session import CardSession, deck_has_unsaved
 from theme import BG, DANGER, MAJOR, MINOR1, SEP, castle_icon, minor, text, title
 from widgets import icon_button, pill_button
 
-GLOBAL_LIMIT = 100
+GLOBAL_PAGE = 30          # decks fetched per page of the deck list
 GLOBAL_MAX_AGE = 120.0   # seconds before the deck list is refreshed again
 LOG_KEEP = 3000
 LOG_LEVELS = [(0, "Errors only"), (1, "Normal"), (2, "Verbose")]
@@ -150,6 +150,9 @@ class App:
         self.avatar_bytes: Optional[bytes] = None
         self.online = True
         self.global_decks: list[dict] = []
+        self.global_limit = GLOBAL_PAGE             # how many decks the last list request asked for
+        self.global_more = False                    # Castle may have more decks than are loaded
+        self.global_loading = False                 # a "load more" request is running
         self.global_loaded_at = 0.0
         self.decks_tab = "RECENT"
         self.sessions: dict[tuple, CardSession] = {}
@@ -199,6 +202,8 @@ class App:
             if self.avatar_file.exists():
                 self.avatar_bytes = self.avatar_file.read_bytes()
         self.global_decks = _read_json(self.global_file, []) or []
+        self.global_limit = max(GLOBAL_PAGE, -(-len(self.global_decks) // GLOBAL_PAGE) * GLOBAL_PAGE)
+        self.global_more = len(self.global_decks) >= GLOBAL_PAGE
 
     @property
     def signed_in(self) -> bool:
@@ -222,6 +227,7 @@ class App:
         self.user = None
         self.avatar_bytes = None
         self.global_decks = []
+        self.global_limit, self.global_more, self.global_loading = GLOBAL_PAGE, False, False
         for f in (self.session_file, self.profile_file, self.avatar_file, self.global_file):
             f.unlink(missing_ok=True)
 
@@ -311,13 +317,17 @@ class App:
 
     # ── Castle's deck list ────────────────────────────────────────────────
     async def refresh_global(self, force: bool = False, repaint: bool = True) -> bool:
+        """Reload the deck list, keeping as many decks as are already loaded (a refresh never shortens the list)."""
         if not self.api.token or not (self.user or {}).get("userId"):
+            return False
+        if self.global_loading:
             return False
         if not force and self.global_loaded_at and time.monotonic() - self.global_loaded_at < GLOBAL_MAX_AGE:
             return False
         self.global_loaded_at = time.monotonic()     # also on failure: never hammer Castle / loop on rebuilds
+        limit = self.global_limit
         try:
-            decks = await asyncio.to_thread(list_recent_decks, self.api, GLOBAL_LIMIT, self.user["userId"])
+            decks = await asyncio.to_thread(list_recent_decks, self.api, limit, self.user["userId"])
         except OfflineError:
             self.online = False
             return False
@@ -326,10 +336,38 @@ class App:
             return False
         self.online = True
         self.global_decks = decks
+        self.global_more = len(decks) >= limit
         _write_json(self.global_file, decks)
         self.log(f"Deck list refreshed: {len(decks)} decks", 2)
         if repaint:
             self.refresh_body_if("Decks")
+        return True
+
+    async def load_more_global(self) -> bool:
+        """Load the next page of the deck list. Castle's list has no offset, so this asks for a bigger
+        limit and keeps the whole answer. Does not repaint: the Decks screen adds the rows itself."""
+        if self.global_loading or not self.global_more or not self.api.token or not (self.user or {}).get("userId"):
+            return False
+        have, limit = len(self.global_decks), self.global_limit + GLOBAL_PAGE
+        self.global_loading = True
+        try:
+            decks = await asyncio.to_thread(list_recent_decks, self.api, limit, self.user["userId"])
+        except OfflineError:
+            self.online = False
+            self.toast("No Wi-Fi.", error=True)
+            return False
+        except Exception as ex:
+            self.log(f"error: decks: {ex}")
+            return False
+        finally:
+            self.global_loading = False
+        self.online = True
+        self.global_decks = decks
+        self.global_limit = limit
+        # no growth means Castle has nothing more to give (or caps the list), so stop asking
+        self.global_more = len(decks) >= limit and len(decks) > have
+        _write_json(self.global_file, decks)
+        self.log(f"Deck list: {len(decks)} decks loaded", 2)
         return True
 
     # ── navigation ────────────────────────────────────────────────────────

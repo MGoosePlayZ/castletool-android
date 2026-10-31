@@ -1,6 +1,6 @@
 [project]
 name = "castletool-android"
-version = "0.5.0"
+version = "0.6.0"
 description = "Castletool for Android: browse, edit and save Castle decks via the Castle API"
 readme = "README.md"
 requires-python = ">=3.13"          # Flet bundles the highest supported Python that satisfies this (3.14)
