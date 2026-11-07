@@ -61,7 +61,7 @@ for cid, n in (("a", 6), ("b", 6)):                                             
 (big / "deck.json").write_text(json.dumps({"deckId": "big", "cards": [{"cardId": "a"}, {"cardId": "b"}], "initialCard": {"cardId": "a"}}))
 size = ds.deck_upload_size(big); assert 12 * 1048576 < size < 12.1 * 1048576, size
 assert 6 * 1048576 < ds.card_upload_size(big / "cards/a") < 6.1 * 1048576
-ds.assert_deck_fits(big)                                                                 # 12 MB in total is fine: no single card is over 10 MB
+ds.assert_deck_fits(big)                                                                 # 12 MB in total is fine: no single card is over 50 MB
 class Rec:
     def __init__(self): self.up = []; self.saved = []
     def upload_scene_data(self, cid, sd): self.up.append(cid); return "up-" + cid
@@ -71,8 +71,10 @@ class Rec:
 r = Rec(); ds.push_card(r, big, "a"); assert r.up == ["a"]                               # only card a is measured and sent
 r = Rec(); ds.push_deck(r, big, log=lambda m: None); assert r.up == ["a", "b"] and r.saved == ["a", "b"]
 (big / "cards/b/scene/blueprints/x.json").write_text(json.dumps({"entryId": "xb", "pad": "z" * (11 * 1024 * 1024)}))
-try: ds.assert_card_fits(big / "cards/b"); raise SystemExit("11 MB card accepted")
-except ca.UploadTooLarge as ex: assert "Card b" in str(ex) and "11.0 MB" in str(ex) and "10 MB" in str(ex), ex
+ds.assert_card_fits(big / "cards/b")                                                     # 11 MB is fine now: scene data goes to S3 (50 MB cap)
+(big / "cards/b/scene/blueprints/x.json").write_text(json.dumps({"entryId": "xb", "pad": "z" * (51 * 1024 * 1024)}))
+try: ds.assert_card_fits(big / "cards/b"); raise SystemExit("51 MB card accepted")
+except ca.UploadTooLarge as ex: assert "Card b" in str(ex) and "51.0 MB" in str(ex) and "50 MB" in str(ex), ex
 class Net:
     def __getattr__(self, n): raise SystemExit("network touched: " + n)
 try: ds.push_deck(Net(), big); raise SystemExit("pushed")

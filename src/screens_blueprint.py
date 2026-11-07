@@ -384,9 +384,10 @@ class BlueprintView:
 
     async def on_pick_layer(self, target: str):
         """New layer (target == lyr.NEW) or overwrite one: pick a file, then the usual import dialog."""
-        path = await self.app.pick(MEDIA_EXTS, "Choose image, video, SVG, font or archive")
-        if not path:
+        paths = await self.app.pick_many(MEDIA_EXTS, "Choose image, video, SVG, font or archive")
+        if not paths:
             return
+        path = paths[0] if len(paths) == 1 else await self.app.run(lambda: self.app.stage_files(paths))
         info = await self.app.run(lambda: ops.inspect_media(path, log=self.app.log))
         if not info:
             return
@@ -559,8 +560,30 @@ class BlueprintView:
         path = await self.app.pick(["mid", "midi", "smf"], "Choose a MIDI file")
         if not path:
             return
+        holder: dict = {}
+        offset = {"v": 0}
+        label = text("Volume offset: 0", 14, MINOR1)
+
+        def drag(ev):
+            offset["v"] = ct.clamp_volume_offset(ev.control.value)
+            label.value = f"Volume offset: {offset['v']:+d}" if offset["v"] else "Volume offset: 0"
+            self.app.page.update()
+
+        slider = ft.Slider(min=ct.VOLUME_OFFSET_MIN, max=ct.VOLUME_OFFSET_MAX, divisions=ct.VOLUME_OFFSET_MAX * 2,
+                           value=0, active_color=MAJOR, inactive_color=SEP, on_change=drag)
+
+        def go(ev):
+            self.app.close_dialog(holder["dlg"])
+            self.app.spawn(self.import_midi_file(path, offset["v"]))
+
+        holder["dlg"] = self.app.dialog(
+            "Import MIDI", ft.Column([label, slider], spacing=6, tight=True, width=300),
+            [ft.TextButton(content=text("Import", 14, MAJOR, bold=True), on_click=go)])
+
+    async def import_midi_file(self, path: Path, volume_offset: int = 0):
         res = await self.ctx.edit_async("Importing MIDI", lambda task: ops.import_midi(
-            self.bp_path, self.card_dir, path, log=self.app.log, task=task))
+            self.bp_path, self.card_dir, path, log=self.app.log, task=task,
+            volume_offset=ct.clamp_volume_offset(volume_offset)))
         await self.after_edit(res, "MIDI imported.")
 
     async def on_download_music(self):

@@ -548,9 +548,12 @@ def set_card_tempo(card: Path, bpm: float):
 # ── image/gif → Drawing2 ─────────────────────────────────────────────────────
 
 def load_image_frames(path: Path, width: int, height: int, ico_size=None,
-                      smooth: bool = False):
-    """Decode an image (or every frame of an animation) as PNG bytes resized to
-    width×height. `smooth` = bilinear interpolation; off = crisp nearest-neighbor."""
+                      smooth: bool = False, every_n: int = 1):
+    """Decode an image (or every Nth frame of an animation) as PNG bytes resized to
+    width×height. `smooth` = bilinear interpolation; off = crisp nearest-neighbor.
+    Frames that are skipped (`every_n`) are never resized or encoded. The returned fps is
+    already divided by `every_n`."""
+    every_n = max(1, int(every_n))
     resample = Image.BILINEAR if smooth else Image.NEAREST
     img = Image.open(path)
     if ico_size:
@@ -569,21 +572,26 @@ def load_image_frames(path: Path, width: int, height: int, ico_size=None,
     durations = []
     total = getattr(img, "n_frames", 0) or 0
 
+    keep_total = -(-total // every_n) if total else 0
     try:
+        index = 0
         while True:
-            report_step(len(frames), total, f"Processing frame {len(frames) + 1}/{total}" if total else
-                        f"Processing frame {len(frames) + 1}")
-            frame = img.convert("RGBA").resize((width, height), resample)
-            buf = io.BytesIO()
-            frame.save(buf, format="PNG")
-            frames.append(buf.getvalue())
             durations.append(max(img.info.get("duration", 100), 1))
+            if index % every_n == 0:
+                n_done = len(frames)
+                report_step(n_done, keep_total, f"Processing frame {n_done + 1}/{keep_total}" if keep_total else
+                            f"Processing frame {n_done + 1}")
+                frame = img.convert("RGBA").resize((width, height), resample)
+                buf = io.BytesIO()
+                frame.save(buf, format="PNG")
+                frames.append(buf.getvalue())
+            index += 1
             img.seek(img.tell() + 1)
     except EOFError:
         pass
 
     avg_ms = sum(durations) / len(durations)
-    fps = round(1000 / avg_ms, 2)
+    fps = round(1000 / avg_ms, 2) / every_n
 
     return frames, fps
 
@@ -1974,7 +1982,21 @@ def _build_drum_track(track: dict, t_idx: int, patterns: dict):
         "sequence": {beat_key(0): {"patternId": pid, "loop": False}},
     }
 
-def build_music(mid, beats_per_bar: int = 4) -> dict:
+VOLUME_OFFSET_MIN, VOLUME_OFFSET_MAX = -127, 127
+
+
+def clamp_volume_offset(value) -> int:
+    """The volume offset as an int inside -127..127 (anything unreadable counts as 0)."""
+    try:
+        return max(VOLUME_OFFSET_MIN, min(VOLUME_OFFSET_MAX, int(round(float(value)))))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def build_music(mid, beats_per_bar: int = 4, volume_offset: int = 0) -> dict:
+    """volume_offset (-127..127) is added to the velocity of every tone note (result kept in
+    1..127). Drum hits carry no velocity, so they are not affected."""
+    volume_offset = clamp_volume_offset(volume_offset)
     with report_span(0.0, 0.3):
         midi_tracks = collect_midi_tracks(mid)
     patterns, castle_tracks = {}, []
@@ -1996,6 +2018,8 @@ def build_music(mid, beats_per_bar: int = 4) -> dict:
             # "key" already sits at the same octave the MIDI file uses
             # (raw note number), so bump it one octave higher per spec.
             octave_note = min(127, note + 12)
+            if volume_offset:
+                velocity = max(1, min(127, int(velocity) + volume_offset))
             notes_by_beat.setdefault(round(beat, 9), []).append((octave_note, velocity))
 
         pid = str(uuid.uuid4())
@@ -2202,8 +2226,11 @@ def extract_archive(path: Path, dest: Path) -> list[Path]:
 
 def gather_media(path: Path, tmp_dir: Path):
     """Turn what the user pointed at (a file or an archive) into
-    (files, category). Prints the reason and returns None if nothing usable."""
-    if not is_archive(path):
+    (files, category). Prints the reason and returns None if nothing usable.
+    A folder works like an archive: every file inside it is looked at (a picked set of files
+    is staged into one)."""
+    from_dir = path.is_dir()
+    if not from_dir and not is_archive(path):
         if path.stat().st_size == 0:
             pe(f"{path.name} is empty (0 bytes).")
             return None
@@ -2213,14 +2240,17 @@ def gather_media(path: Path, tmp_dir: Path):
             return None
         return [path], cat
 
-    pb(f"Reading archive: {path.name}")
-    try:
-        files = extract_archive(path, tmp_dir)
-    except Exception as e:
-        pe(f"Could not read archive: {e}")
-        return None
+    if from_dir:
+        files = sorted(f for f in path.rglob("*") if f.is_file())
+    else:
+        pb(f"Reading archive: {path.name}")
+        try:
+            files = extract_archive(path, tmp_dir)
+        except Exception as e:
+            pe(f"Could not read archive: {e}")
+            return None
     if not files:
-        pe("The archive doesn't contain any files.")
+        pe("There aren't any files to read." if from_dir else "The archive doesn't contain any files.")
         return None
 
     by_cat: dict[str, list[Path]] = {}
@@ -2240,7 +2270,7 @@ def gather_media(path: Path, tmp_dir: Path):
     if ignored:
         pw(f"Ignored {ignored} unsupported file(s) in the archive.")
     if not by_cat:
-        pe("No supported files were found in the archive.")
+        pe("No supported files were found." if from_dir else "No supported files were found in the archive.")
         p(f"If you'd like a format supported, please make an issue on GitHub: {ISSUES_URL}")
         return None
     if len(by_cat) > 1:
@@ -2589,10 +2619,7 @@ def render_visual(path: Path, cat: str, st: dict, ico_size=None):
                                              smooth=st["smooth"])
         else:
             frames, fps = load_image_frames(path, width, height, ico_size=ico_size,
-                                            smooth=st["smooth"])
-            if st["every"] > 1:
-                frames = frames[::st["every"]]
-                fps = fps / st["every"]
+                                            smooth=st["smooth"], every_n=st["every"])
     if st["quantize"]:
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
         with report_span(load_end, 1.0):

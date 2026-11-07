@@ -76,9 +76,16 @@ class CastleAPIError(Exception):
     pass
 
 
-# Castle's uploads go through AWS API Gateway, which refuses anything over 10 MB.
-UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024
-TOO_LARGE_MESSAGE = "This card is over Castle's 10 MB upload limit. Remove some media and try again."
+# Scene data goes straight to S3 through a presigned POST whose policy says
+# content-length-range 0-52428800, so it never meets the API gateway's 10 MB cap.
+# Images (and audio) still go through the gateway as GraphQL multipart uploads.
+UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
+IMAGE_UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024
+TOO_LARGE_MESSAGE = "That upload is over Castle's size limit."
+
+
+class SceneDataForbidden(CastleAPIError):
+    """Castle's storage refused to hand out a card's scene data (HTTP 403)."""
 
 
 class UploadTooLarge(CastleAPIError):
@@ -279,6 +286,8 @@ class CastleAPI:
     def download_scene_data(self, scene_data_url: str) -> Any:
         # Plain GET to storage; no auth header.
         r = requests.get(scene_data_url, timeout=30)
+        if r.status_code == 403:
+            raise SceneDataForbidden(f"403 Forbidden for {scene_data_url}")
         r.raise_for_status()
         return r.json()
 
@@ -326,9 +335,9 @@ class CastleAPI:
         if not mime:
             raise CastleAPIError("Cover images must be PNG or JPEG.")
         data = path.read_bytes()
-        if len(data) > UPLOAD_LIMIT_BYTES:
+        if len(data) > IMAGE_UPLOAD_LIMIT_BYTES:
             raise UploadTooLarge(f"That image is {len(data) / 1048576:.1f} MB, over Castle's "
-                                 f"{UPLOAD_LIMIT_BYTES // 1048576} MB upload limit.")
+                                 f"{IMAGE_UPLOAD_LIMIT_BYTES // 1048576} MB upload limit.")
         operations = json.dumps({
             "query": "mutation UploadFile($file: Upload!) { uploadFile(file: $file) { fileId url } }",
             "variables": {"file": None},

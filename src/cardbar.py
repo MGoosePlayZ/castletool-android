@@ -32,7 +32,7 @@ class CardContext:
         self.saving = False
 
     def size_bytes(self) -> int:
-        """Bytes of this card's scene data as Castle receives it (what its 10 MB limit measures).
+        """Bytes of this card's scene data as Castle receives it (what its 50 MB limit measures).
         Rebuilt only when a file in the card's folder changed."""
         stamp = []
         for root, _dirs, files in os.walk(self.card_dir):
@@ -79,7 +79,7 @@ class CardContext:
 
 
 def size_meter(ctx: CardContext) -> ft.Control:
-    """How full the card is against Castle's 10 MB limit: white under 50%, yellow over 50%, red over 75%."""
+    """How full the card is against Castle's 50 MB limit: white under 50%, yellow over 50%, red over 75%."""
     size = ctx.size_bytes()
     frac = size / UPLOAD_LIMIT_BYTES
     pct = round(frac * 100)

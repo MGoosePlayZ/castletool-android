@@ -707,6 +707,25 @@ class App:
             return None
         return Path(files[0].path)
 
+    async def pick_many(self, extensions: Optional[list[str]] = None, title_: str = "Choose files") -> list[Path]:
+        """Like pick(), but the person may choose several files. Returns them in the order given."""
+        kwargs = dict(dialog_title=title_, allow_multiple=True)
+        if extensions:
+            kwargs["file_type"] = ft.FilePickerFileType.CUSTOM
+            kwargs["allowed_extensions"] = [e.lstrip(".") for e in extensions]
+        files = await self.picker.pick_files(**kwargs)
+        return [Path(f.path) for f in (files or []) if f.path]
+
+    def stage_files(self, paths: list[Path]) -> Path:
+        """Copy several picked files into one fresh folder (kept in pick order) so they can be
+        imported like an archive. The previous staging folder is thrown away."""
+        root = self.cache_dir / "multi-import"
+        shutil.rmtree(root, ignore_errors=True)
+        for i, src in enumerate(paths):
+            (root / f"{i + 1:04d}").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, root / f"{i + 1:04d}" / Path(src).name)
+        return root
+
     # ── sign in / out ─────────────────────────────────────────────────────
     async def _signed_in_as(self, user: dict):
         self._save_session()

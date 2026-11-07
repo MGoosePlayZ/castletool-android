@@ -30,8 +30,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import tasks
-from castle_api import (CastleAPI, CastleAPIError, UNLISTED_TEST_CONTENT_FLAGS, UPLOAD_LIMIT_BYTES,
-                        UploadTooLarge)
+from castle_api import (CastleAPI, CastleAPIError, SceneDataForbidden, UNLISTED_TEST_CONTENT_FLAGS,
+                        UPLOAD_LIMIT_BYTES, UploadTooLarge)
 
 Log = Callable[[str], None]
 
@@ -151,7 +151,7 @@ def cauldron_status(cache_file: Path, deck_dir: Path) -> tuple[Optional[bool], b
     card_id, url = _top_card(deck_dir)
     entry = _read_cauldron_cache(cache_file).get(card_id) if card_id else None
     if isinstance(entry, dict) and "cauldron" in entry and (not url or entry.get("url") == url):
-        return bool(entry["cauldron"]), False
+        return bool(entry["cauldron"]), False       # also the "unreadable" entries: not asked again
     return None, bool(card_id and url)
 
 
@@ -163,9 +163,14 @@ def detect_cauldron(api: CastleAPI, deck_dir: Path, cache_file: Path) -> bool:
     if known is not None or not needs_fetch:
         return bool(known)
     card_id, url = _top_card(deck_dir)
-    result = scene_uses_cauldron(api.download_scene_data(url))
     cache = _read_cauldron_cache(cache_file)
-    cache[card_id] = {"url": url, "cauldron": result}
+    try:
+        result = scene_uses_cauldron(api.download_scene_data(url))
+        cache[card_id] = {"url": url, "cauldron": result}
+    except SceneDataForbidden:
+        # Castle won't show this scene data (403): don't check, just open the deck as a normal one.
+        result = False
+        cache[card_id] = {"url": url, "cauldron": False, "unreadable": True}
     _write_json(Path(cache_file), cache)
     return result
 
@@ -245,7 +250,13 @@ def clone_deck(api: CastleAPI, deck_id: str, root: Path, log: Log = print) -> Pa
             continue
         tasks.step(ci, len(cards), f"Downloading card {ci + 1}/{len(cards)}")
         log(f"getting {card['cardId']}...")
-        scene_data = api.download_scene_data(card["sceneDataUrl"])
+        try:
+            scene_data = api.download_scene_data(card["sceneDataUrl"])
+        except SceneDataForbidden:
+            # 403 from Castle's storage (seen on cauldron decks): skip this card's blueprints and
+            # open the deck anyway instead of failing the whole clone.
+            log(f"warning: Castle won't give out the scene data of card {card['cardId']} (403); skipped.")
+            continue
         _write_card(deck_dir / "cards" / card["cardId"], card, scene_data)
 
     log(f"Got {deck['deckId']}")

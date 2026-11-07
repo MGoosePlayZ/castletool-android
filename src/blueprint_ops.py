@@ -689,8 +689,9 @@ def set_text_props(bp_path: Path, **props) -> None:
 # ── MIDI → Music ─────────────────────────────────────────────────────────
 
 @_guard
-def import_midi(bp_path: Path, card_dir: Path, midi_path: Path, *, log: Log) -> dict:
-    """Port of do_add_midi(). Also sets the card tempo. Returns the Music dict."""
+def import_midi(bp_path: Path, card_dir: Path, midi_path: Path, *, log: Log, volume_offset: int = 0) -> dict:
+    """Port of do_add_midi(). Also sets the card tempo. Returns the Music dict.
+    volume_offset (-127..127, clamped) is added to every tone note's velocity."""
     if not ct.HAS_MIDO:
         raise OpError("mido is not installed.")
     midi_path = Path(midi_path)
@@ -701,7 +702,7 @@ def import_midi(bp_path: Path, card_dir: Path, midi_path: Path, *, log: Log) -> 
     except Exception as e:
         raise OpError(f"Could not read MIDI: {e}")
     with tasks.span(0.0, 0.95):
-        music = ct.build_music(mid)
+        music = ct.build_music(mid, volume_offset=volume_offset)
     log(f"MIDI ready: {len(music['song']['patterns'])} patterns, {len(music['song']['tracks'])} tracks")
     actor = load_blueprint(bp_path)
     ensure_components(actor)["Music"] = music
