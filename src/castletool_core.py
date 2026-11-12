@@ -6,12 +6,14 @@ Streamlines injecting images/GIFs and MIDI into Castle blueprint JSON files.
 
 import base64
 import bisect
+import colorsys
 import copy
 import io
 import json
 import math
 import os
 import platform
+import random
 import re
 import shutil
 import struct
@@ -1759,7 +1761,11 @@ def build_drawing2_font(glyph_frames: list[tuple[int, list, dict]],
 # ── midi → Music ─────────────────────────────────────────────────────────────
 
 def beat_key(b): return f"{b:.6f}"
-def make_color(): return {"r": 0.19607, "g": 0.16862, "b": 0.15681, "a": 1.0}
+def make_color() -> dict:
+    """A random vibrant pattern color: any hue, saturation 70-100 %, lightness 30-70 %.
+    Called once per imported track, so every track gets its own color."""
+    r, g, b = colorsys.hls_to_rgb(random.random(), random.uniform(0.3, 0.7), random.uniform(0.7, 1.0))
+    return {"r": round(r, 5), "g": round(g, 5), "b": round(b, 5), "a": 1.0}
 
 DEFAULT_TEMPO = 500000  # microseconds per beat == 120 BPM, mido/MIDI spec default
 

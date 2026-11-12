@@ -14,6 +14,7 @@ import castletool_core as ct
 import drawing
 import layers as lyr
 import live_synth
+import piano_roller
 import synth
 import tasks
 import theme
@@ -35,11 +36,6 @@ def blueprint_screen(app, ctx: CardContext, bp_path: Path) -> Screen:
     view = BlueprintView(app, ctx, bp_path)
     return Screen(title="", build=lambda a: view.build(), bar=lambda a: card_bar(a, ctx, "blueprint"),
                   on_leave=view.dispose, title_font=False, sig=lambda a: ctx.bar_sig())
-
-
-def _clock(seconds: float) -> str:
-    s = max(0, int(seconds))
-    return f"{s // 60}:{s % 60:02d}"
 
 
 class BlueprintView:
@@ -489,72 +485,26 @@ class BlueprintView:
         return ft.Column(out, spacing=8)
 
     def player_controls(self, music: dict, bpm: float) -> ft.Control:
-        """Live playback: oscillators are mixed as the song plays and streamed to the speaker."""
+        """Piano roller with live playback: oscillators are mixed as the song plays and streamed to the speaker."""
         android = self.app.page.platform == ft.PagePlatform.ANDROID
         try:
             eng = live_synth.LiveSynth(music, bpm, lambda: live_synth.make_sink(android))
         except Exception as ex:
             return minor(str(ex), 12)
-        if not eng.notes:
+        model = piano_roller.build_model(music, bpm)
+        if not eng.notes or model is None:
             return minor("No notes", 12)
         self.engine = eng
         eng.loop = False
-        dur_ms = max(1, int(eng.duration * 1000))
-        state = {"dragging": False, "icon": "play_music"}
-
-        play_btn = icon_button(castle_icon("play_music", 26), None, size=44)
-        slider = ft.Slider(min=0, max=dur_ms, value=0, expand=True, active_color=MAJOR, inactive_color=SEP)
-        # fixed-width time slots: DM Sans digits aren't tabular, so the slider must not jiggle
-        elapsed = ft.Container(text("0:00", 12, MINOR1, text_align=ft.TextAlign.RIGHT), width=40,
-                               alignment=ft.Alignment.CENTER_RIGHT)
-        length = ft.Container(text(_clock(eng.duration), 12, MINOR1, text_align=ft.TextAlign.LEFT), width=40,
-                              alignment=ft.Alignment.CENTER_LEFT)
-
-        def paint_icon():
-            icon = "stop" if eng.playing else "play_music"
-            if icon != state["icon"]:
-                state["icon"] = icon
-                play_btn.content = castle_icon(icon, 26)
-
-        def toggle(e):
-            if eng.playing:
-                eng.stop()                              # stop = back to the start
-                slider.value = 0
-                elapsed.content.value = "0:00"
-            else:
-                eng.play()
-            paint_icon()
-            self.app.page.update()
-
-        def drag_start(e):
-            state["dragging"] = True
-
-        def drag_end(e):
-            state["dragging"] = False
-            eng.seek(float(e.control.value) / 1000)
-
-        play_btn.on_click = toggle
-        slider.on_change_start, slider.on_change_end = drag_start, drag_end
+        width = min(float(getattr(self.app.page, "width", None) or 360) - 28, 560)       # the panel has 14 px padding
+        roller = piano_roller.PianoRoller(self.app, eng, model, width,
+                                          lambda msg: self.app.toast(msg, error=True))
         token = self.anim_token
-
-        async def tick():
-            shown_error = False
-            while token == self.anim_token and self.alive:
-                if eng.error and not shown_error:
-                    shown_error = True
-                    self.app.toast(eng.error, error=True)
-                if not state["dragging"]:
-                    slider.value = min(eng.position * 1000, dur_ms)
-                elapsed.content.value = _clock(eng.position)
-                paint_icon()
-                self.app.page.update()
-                await asyncio.sleep(0.1)
-
-        self.app.page.run_task(tick)
-        row = ft.Row([play_btn, elapsed, slider, length], spacing=2, vertical_alignment=ft.CrossAxisAlignment.CENTER)
+        self.app.page.run_task(roller.run, lambda: token == self.anim_token and self.alive)
+        box = ft.Container(roller.control, alignment=ft.Alignment.CENTER)
         if eng.warnings:
-            return ft.Column([row, info_note("\n".join(eng.warnings))], spacing=6)
-        return row
+            return ft.Column([box, info_note("\n".join(eng.warnings))], spacing=6)
+        return box
 
     async def on_pick_midi(self, e):
         path = await self.app.pick(["mid", "midi", "smf"], "Choose a MIDI file")

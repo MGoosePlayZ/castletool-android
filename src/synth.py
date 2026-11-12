@@ -217,6 +217,28 @@ def collect_notes(music: dict, bpm: float) -> list[dict]:
     return out
 
 
+def track_colors(music: dict) -> list[str]:
+    """'#rrggbb' per track: the color of the pattern the track starts with (white when it has none)."""
+    song = (music or {}).get("song") or {}
+    patterns = song.get("patterns") or {}
+    out = []
+    for track in song.get("tracks") or []:
+        clips = _clips(track, patterns)
+        c = (clips[0][1].get("color") if clips else None) or None
+        if not isinstance(c, dict):
+            out.append("#ffffff")
+            continue
+
+        def ch(k: str) -> int:
+            try:
+                v = float(c.get(k, 1))
+            except (TypeError, ValueError):
+                v = 1.0
+            return round(max(0.0, min(1.0, v)) * 255)
+        out.append("#%02x%02x%02x" % (ch("r"), ch("g"), ch("b")))
+    return out
+
+
 def music_stats(music: dict, bpm: float) -> dict:
     notes = collect_notes(music, bpm)
     song = (music or {}).get("song") or {}

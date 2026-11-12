@@ -22,41 +22,67 @@ STROKE_UNITS = 0.28
 SS = 3  # supersampling for vector strokes
 
 
-def arc_points(p1, bp, p2) -> list:
-    """Circular arc from p1 to p2 that passes through the bend point bp (what you
-    drag on a line in Castle's draw tool). Falls back to a straight line when the
-    three points are (almost) collinear."""
-    (x1, y1), (xb, yb), (x2, y2) = p1, bp, p2
-    d = 2 * (x1 * (yb - y2) + xb * (y2 - y1) + x2 * (y1 - yb))
-    chord = math.hypot(x2 - x1, y2 - y1)
-    if chord < 1e-9 or abs(d) < 1e-7 * max(1.0, chord * chord):
+_TAU = 2 * math.pi
+
+
+def _sag_arc(p1, bp, p2, n: int = 96) -> list:
+    """Castle's arc segment: a circular arc from p1 to p2 whose bulge (sagitta) is the
+    perpendicular distance of the bend point `bp` from the chord. The bulge is capped at a
+    semicircle (L/2). Falls back to a straight line when there is no bulge."""
+    cx_, cy_ = p2[0] - p1[0], p2[1] - p1[1]
+    chord = math.hypot(cx_, cy_)
+    if chord < 1e-9:
         return [p1, p2]
-    s1, s2, s3 = x1 * x1 + y1 * y1, xb * xb + yb * yb, x2 * x2 + y2 * y2
-    ux = (s1 * (yb - y2) + s2 * (y2 - y1) + s3 * (y1 - yb)) / d
-    uy = (s1 * (x2 - xb) + s2 * (x1 - x2) + s3 * (xb - x1)) / d
-    r = math.hypot(x1 - ux, y1 - uy)
-    a1 = math.atan2(y1 - uy, x1 - ux)
-    ab = math.atan2(yb - uy, xb - ux)
-    a2 = math.atan2(y2 - uy, x2 - ux)
-    tau = 2 * math.pi
-    ccw_b, ccw_2 = (ab - a1) % tau, (a2 - a1) % tau
-    sweep = ccw_2 if ccw_b <= ccw_2 else -((a1 - a2) % tau)     # the way round that contains bp
-    n = max(6, min(96, int(abs(sweep) * r / 0.15) + 2))
-    pts = [(ux + r * math.cos(a1 + sweep * i / n), uy + r * math.sin(a1 + sweep * i / n)) for i in range(n + 1)]
+    nx, ny = -cy_ / chord, cx_ / chord
+    mx, my = (p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2
+    h = (bp[0] - mx) * nx + (bp[1] - my) * ny
+    h = math.copysign(min(abs(h), chord / 2), h)
+    a = abs(h)
+    if a < 1e-6:
+        return [p1, p2]
+    r = (chord * chord / 4 + a * a) / (2 * a)
+    sg = 1.0 if h > 0 else -1.0
+    cx, cy = mx + nx * sg * (a - r), my + ny * sg * (a - r)
+    apex = (mx + nx * h, my + ny * h)
+    ccw = (p1[0] - cx) * (apex[1] - cy) - (p1[1] - cy) * (apex[0] - cx) > 0
+    a1 = math.atan2(p1[1] - cy, p1[0] - cx)
+    a2 = math.atan2(p2[1] - cy, p2[0] - cx)
+    sweep = (a2 - a1) % _TAU if ccw else -((a1 - a2) % _TAU)
+    pts = [(cx + r * math.cos(a1 + sweep * i / n), cy + r * math.sin(a1 + sweep * i / n)) for i in range(n + 1)]
     pts[0], pts[-1] = p1, p2                                    # exact end points
     return pts
 
 
+def _quarter_arc(a, b, kind: int, n: int = 24) -> list:
+    """Segments of type 2 / 3 carry no bend point: they are quarter ellipses whose centre is a corner
+    of the chord's bounding box (type 2 bulges toward smaller y, type 3 toward larger y)."""
+    c1, c2 = (a[0], b[1]), (b[0], a[1])
+    cen = (c1 if c1[1] >= c2[1] else c2) if kind == 2 else (c1 if c1[1] <= c2[1] else c2)
+    ux, uy = a[0] - cen[0], a[1] - cen[1]
+    vx, vy = b[0] - cen[0], b[1] - cen[1]
+    out = []
+    for i in range(n + 1):
+        f = math.pi / 2 * i / n
+        c, s = math.cos(f), math.sin(f)
+        out.append((cen[0] + ux * c + vx * s, cen[1] + uy * c + vy * s))
+    return out
+
+
 def segment_points(seg: dict) -> list:
-    """Polyline for one pathDataList entry: a straight line, or a circular arc when
-    the segment has a bend point `bp`."""
+    """Polyline for one pathDataList entry: a straight line, a circular arc (segment with a
+    bend point `bp`, see _sag_arc) or a quarter arc (type 2 / 3 without `bp`)."""
     p = seg.get("p") or []
     if len(p) < 4:
         return []
+    a, b = (p[0], p[1]), (p[2], p[3])
     bp = seg.get("bp")
+    if not bp:
+        if seg.get("s") in (2, 3):
+            return _quarter_arc(a, b, seg["s"])
+        return [a, b]
     if isinstance(bp, dict) and "x" in bp and "y" in bp:
-        return arc_points((p[0], p[1]), (bp["x"], bp["y"]), (p[2], p[3]))
-    return [(p[0], p[1]), (p[2], p[3])]
+        return _sag_arc(a, (bp["x"], bp["y"]), b)
+    return [a, b]
 
 
 def get_drawing2(bp: dict) -> Optional[dict]:
