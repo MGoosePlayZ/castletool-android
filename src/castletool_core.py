@@ -29,7 +29,7 @@ import zipfile
 from collections import Counter
 from pathlib import Path
 
-CURRENT_VERSION = "0.7.0"
+CURRENT_VERSION = "0.8.0"
 PYPI_URL = "https://pypi.org/pypi/castletool/json"
 
 # ── optional deps ────────────────────────────────────────────────────────────
@@ -912,6 +912,21 @@ def quantize_frames(frames: list, colors: int) -> list:
         report_step(i, n, f"Reducing colors {i + 1}/{n}")
         out.append(quantize_frame(f, colors))
     return out
+
+
+def reduce_frames(frames: list, st: dict) -> list:
+    """Basic quantization first (if on), then snap to the picked fixed palettes (if any)."""
+    if st.get("quantize"):
+        frames = quantize_frames(frames, st["quantize"])
+    names = st.get("palettes") or []
+    if names:
+        import palettes
+        n, out = len(frames), []
+        for i, f in enumerate(frames):
+            report_step(i, n, f"Applying palette {i + 1}/{n}")
+            out.append(palettes.apply_palettes(f, names))
+        frames = out
+    return frames
 
 
 def quantize_frame(png_bytes: bytes, colors: int) -> bytes:
@@ -2601,9 +2616,9 @@ def render_visual(path: Path, cat: str, st: dict, ico_size=None):
             path, scale=st["scale"], smooth=st["smooth"],
             color=st["color"], fallback_color=st["fallback_color"])
         frames = [png]
-        if st["quantize"]:
+        if st["quantize"] or st.get("palettes"):
             pb(f"Quantizing to {st['quantize']} colors...")
-            frames = quantize_frames(frames, st["quantize"])
+            frames = reduce_frames(frames, st)
         drawing2 = build_drawing2(frames, 1.0, width, height, "still",
                                   scale=st["fixed_scale"])
         return drawing2, f"SVG ready: bitmap, {width}×{height}px"
@@ -2618,7 +2633,7 @@ def render_visual(path: Path, cat: str, st: dict, ico_size=None):
 
     width, height = scaled_size(visual_native_size(path, cat, ico_size), st["scale"])
     pb(f"Loading {'video' if cat == 'video' else 'image'}: {path.name}")
-    load_end = 0.8 if st["quantize"] else 1.0
+    load_end = 0.8 if (st["quantize"] or st.get("palettes")) else 1.0
     with report_span(0.0, load_end):
         if cat == "video":
             frames, fps = extract_mp4_frames(path, width, height, every_n=st["every"],
@@ -2626,10 +2641,10 @@ def render_visual(path: Path, cat: str, st: dict, ico_size=None):
         else:
             frames, fps = load_image_frames(path, width, height, ico_size=ico_size,
                                             smooth=st["smooth"], every_n=st["every"])
-    if st["quantize"]:
+    if st["quantize"] or st.get("palettes"):
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
         with report_span(load_end, 1.0):
-            frames = quantize_frames(frames, st["quantize"])
+            frames = reduce_frames(frames, st)
     play_mode = "loop" if (cat in ("animation", "video") or len(frames) > 1) else "still"
     drawing2 = build_drawing2(frames, fps, width, height, play_mode,
                               scale=st["fixed_scale"])
@@ -2643,7 +2658,7 @@ def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float
     frames: list[bytes] = []
     sizes: list[tuple[int, int]] = []
 
-    load_end = 0.85 if st["quantize"] else 1.0
+    load_end = 0.85 if (st["quantize"] or st.get("palettes")) else 1.0
     if st["no_scale"]:
         for fi, f in enumerate(files):
             with report_span(0.0, load_end):
@@ -2680,10 +2695,10 @@ def render_frames_actor(files: list[Path], st: dict, ico_sizes: dict, fps: float
             raise ValueError("none of the images could be read")
         sizes = None
 
-    if st["quantize"]:
+    if st["quantize"] or st.get("palettes"):
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
         with report_span(load_end, 1.0):
-            frames = quantize_frames(frames, st["quantize"])
+            frames = reduce_frames(frames, st)
     play_mode = "loop" if len(frames) > 1 else "still"
     drawing2 = build_drawing2(frames, fps, width, height, play_mode,
                               sizes=sizes, scale=st["fixed_scale"])
@@ -2738,9 +2753,9 @@ def render_svg_frames_actor(files: list[Path], st: dict, fps: float):
                 png = buf.getvalue()
             frames.append(png)
         sizes = None
-    if st["quantize"]:
+    if st["quantize"] or st.get("palettes"):
         pb(f"Quantizing {len(frames)} frame(s) to {st['quantize']} colors...")
-        frames = quantize_frames(frames, st["quantize"])
+        frames = reduce_frames(frames, st)
     play_mode = "loop" if len(frames) > 1 else "still"
     drawing2 = build_drawing2(frames, fps, width, height, play_mode,
                               sizes=sizes, scale=st["fixed_scale"])

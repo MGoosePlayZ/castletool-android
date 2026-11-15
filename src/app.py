@@ -17,6 +17,7 @@ from typing import Callable, Optional
 
 import flet as ft
 
+import blocklist
 import tasks
 import theme
 from blueprint_ops import OpError
@@ -155,11 +156,14 @@ class App:
         self.global_loading = False                 # a "load more" request is running
         self.global_loaded_at = 0.0
         self.decks_tab = "RECENT"
+        self.deck_sel: dict[str, str] = {}          # bulk selection on the Decks screen: deckId -> name
+        self.deck_sel_repaint: Optional[Callable] = None   # set by the Decks screen: redraws its rows
         self.sessions: dict[tuple, CardSession] = {}
         self.stack: list[Screen] = []
         self.log_entries: list[tuple[float, int, str]] = []
         self.log_targets: list[ft.Column] = []
         self.active_tasks: set[tasks.Task] = set()
+        self.blocked_msg: Optional[str] = None      # set when this account is on the blocklist (see blocklist.py)
         self.opening: set[str] = set()              # deck ids currently being opened
         self.login_cancel = False
         self.last_work_cancelled = False
@@ -188,7 +192,40 @@ class App:
 
     async def _startup_refresh(self):
         await self.refresh_profile()
-        await self.refresh_global()
+        await self.check_blocked()
+        if not self.blocked_msg:
+            await self.refresh_global()
+
+    # ── blocklist ─────────────────────────────────────────────────────────
+    async def check_blocked(self):
+        """Is the signed-in account on the author's blocklist? Then only the notice is shown (no sign-out)."""
+        name = (self.user or {}).get("username")
+        if not name or self.blocked_msg:
+            return
+        data = await asyncio.to_thread(blocklist.load, self.root / "blocklist.json")
+        msg = blocklist.message_for(data, name)
+        if msg:
+            self.log(f"Account {name} is blocked")
+            self.blocked_msg = msg
+            self._show()
+
+    def _blocked_view(self) -> ft.Control:
+        return ft.Container(ft.Column([
+            text(self.blocked_msg or "", 15, MAJOR, text_align=ft.TextAlign.CENTER),
+            ft.Container(height=8),
+            pill_button("Close app", lambda e: self.spawn(self.close_app()), filled=True, width=200),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, alignment=ft.MainAxisAlignment.CENTER, spacing=12),
+            alignment=ft.Alignment.CENTER, expand=True, padding=24)
+
+    async def close_app(self):
+        try:
+            r = self.page.window.destroy()
+            if inspect.isawaitable(r):
+                await r
+        except Exception:
+            pass
+        await asyncio.sleep(0.4)
+        os._exit(0)             # phones: there is no window to close, so end the process
 
     def _load_cached_session(self):
         """A stored token means 'signed in', even with no connection."""
@@ -417,6 +454,8 @@ class App:
 
     def refresh_body(self):
         """Rebuild only the screen body (the top bar and its images stay untouched)."""
+        if self.blocked_msg:
+            return self._show()
         self.body.content = self.stack[-1].build(self)
         self.page.update()
 
@@ -425,6 +464,8 @@ class App:
             self._show()
 
     def refresh_bar(self):
+        if self.blocked_msg:
+            return self._show()
         s = self.stack[-1]
         sig = (id(s), s.sig(self) if s.sig else None)
         if s.sig and sig == self._bar_sig:
@@ -434,9 +475,18 @@ class App:
         self.topbar_host.content = self._bar(s)
         self.page.update()
 
+    def deck_sel_changed(self):
+        """The bulk selection changed: redraw the rows, the top bar and the back-button behaviour."""
+        if self.deck_sel_repaint:
+            self.deck_sel_repaint()
+        self._sync_back()
+        self.refresh_bar()
+
     def _bar(self, s: Screen) -> ft.Control:
         if s.bar:
-            return s.bar(self)
+            custom = s.bar(self)
+            if custom is not None:                 # a bar that returns None falls back to the standard one
+                return custom
         if s.left:
             left = s.left(self)
         elif len(self.stack) > 1:
@@ -452,6 +502,11 @@ class App:
             padding=ft.Padding(left=6, right=6, top=4, bottom=4))
 
     def _show(self):
+        if self.blocked_msg:                       # a blocked account sees nothing but the notice
+            self.topbar_host.content = ft.Container()
+            self.body.content = self._blocked_view()
+            self.page.update()
+            return
         s = self.stack[-1]
         self.log_targets.clear()
         self._bar_sig = (id(s), s.sig(self) if s.sig else None)
@@ -477,7 +532,7 @@ class App:
         other screen (deck, card, blueprint, profile) it is intercepted and goes back a screen."""
         view = self._root_view()
         if view is not None:
-            want = len(self.stack) <= 1
+            want = len(self.stack) <= 1 and not self.deck_sel     # selecting decks: back deselects them
             if view.can_pop != want:
                 view.can_pop = want
 
@@ -487,6 +542,9 @@ class App:
             await view.confirm_pop(False)          # never let the system close the app from here
         if len(self.stack) > 1:
             self.go_back()                         # screens may intercept it (e.g. "Save changes?")
+        elif self.deck_sel:
+            self.deck_sel.clear()
+            self.deck_sel_changed()
 
     # ── logging ───────────────────────────────────────────────────────────
     def log(self, msg: str, level: int = 1):
@@ -734,7 +792,9 @@ class App:
         self.online = True
         self.global_loaded_at = 0.0
         await self.refresh_profile()
-        await self.refresh_global(force=True, repaint=False)
+        await self.check_blocked()
+        if not self.blocked_msg:
+            await self.refresh_global(force=True, repaint=False)
 
     async def sign_in_password(self, username: str, password: str) -> bool:
         self.login_cancel = False

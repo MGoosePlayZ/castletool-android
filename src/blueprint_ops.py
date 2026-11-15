@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import castletool_core as ct
+from palettes import PALETTES
 import drawing
 import live_synth
 import layers as lyr
@@ -209,6 +210,7 @@ DEFAULT_MEDIA_OPTS = {
     "smooth": False,
     "every": 1,               # keep every Nth frame (animations / video)
     "quantize": 0,            # 0 = off, else colors 1..256
+    "palettes": [],           # fixed palette names; pixels snap to the nearest color (after quantize)
     "svg_style": "vector",    # "vector" | "bitmap"
     "svg_scale": 1.0,         # vector-style scale multiplier
     "steps": 16,              # bezier steps
@@ -216,7 +218,7 @@ DEFAULT_MEDIA_OPTS = {
     "fallback_color": None,
     "fps": 4.0,               # frame-per-file layouts
     "want_audio": True,       # videos: upload sound
-    "fixed_px": False,        # Fixed Pixel Size: every image pixel is `pixel_size` Castle units wide, never resampled
+    "fixed_px": False,        # Original quality: 1 px = 1 px, never resampled / quantized / palettized; only `pixel_size` applies
     "pixel_size": 0.1,
 }
 
@@ -256,11 +258,13 @@ def _media_state(o: dict, cat: str, files, ico_sizes: dict, multi: bool) -> dict
         # Fixed Pixel Size keeps pictures at their own pixel size (a vector drawn as bitmap is still rasterized at its Scale)
         "scale": (1.0 if fixed_px and cat != "vector" else float(o["scale"])) if (cat != "vector" or bitmap) else 1.0,
         "every": max(1, int(o["every"])),
-        "quantize": int(o["quantize"] or 0),
+        # Original quality leaves the pixels untouched: no smoothing, quantizing or palettes
+        "quantize": 0 if fixed_px and cat != "vector" else int(o["quantize"] or 0),
+        "palettes": [] if fixed_px and cat != "vector" else [n for n in (o.get("palettes") or []) if n in PALETTES],
         "svg_scale": float(o["svg_scale"]) * SVG_UNITS_PER_EM,
         "steps": max(2, int(o["steps"])),
         "color": o["color"],
-        "smooth": bool(o["smooth"]),
+        "smooth": bool(o["smooth"]) and not (fixed_px and cat != "vector"),
         "bitmap": bitmap,
         "fallback_color": o["fallback_color"],
         # several pictures of different sizes keep their own sizes, so they all end up with the same pixel size
@@ -319,8 +323,8 @@ def _one_frame_png(f: Path, cat: str, st: dict, ico_size, index: int) -> Optiona
             buf = io.BytesIO()
             img.convert("RGBA").resize((width, height), resample).save(buf, format="PNG")
             png = buf.getvalue()
-    if st["quantize"]:
-        png = ct.quantize_frame(png, st["quantize"])
+    if st["quantize"] or st["palettes"]:
+        png = ct.reduce_frames([png], st)[0]
     return png, width, height
 
 

@@ -11,6 +11,7 @@ from typing import Optional
 
 import flet as ft
 
+import bulk_decks
 import tasks
 import theme
 from app import App, Screen, profile_screen
@@ -172,7 +173,7 @@ def home_screen(app: App) -> Screen:
         return [icon_button(a.avatar(36), lambda e: a.push(profile_screen(a)), "Profile", size=44)]
 
     def bar_sig(a: App):
-        return (id(a.avatar_bytes), a.signed_in)
+        return (id(a.avatar_bytes), a.signed_in, bool(a.deck_sel))
 
     def build(a: App) -> ft.Control:
         a.spawn(a.refresh_global())
@@ -189,6 +190,9 @@ def home_screen(app: App) -> Screen:
 
                 def pick(e, tt=t):
                     a.decks_tab = tt            # only the tab strip and the list change; the top bar stays
+                    if a.deck_sel:              # a selection belongs to the tab it was made in
+                        a.deck_sel.clear()
+                        a.deck_sel_changed()
                     paint_tabs()
                     fill_list()
                     a.page.update()
@@ -267,36 +271,47 @@ def home_screen(app: App) -> Screen:
             loader = ft.Container(ft.ProgressRing(width=20, height=20, stroke_width=2, color=MAJOR), height=36,
                                   alignment=ft.Alignment.CENTER, visible=a.global_loading and a.decks_tab != "LOCAL")
             st["loader"] = loader
-            rows = [deck_row(a, d) for d in items] + [loader, ft.Container(height=spacer + 2)]
+            rows = [deck_row(a, d, d["deckId"] in a.deck_sel) for d in items] + [loader, ft.Container(height=spacer + 2)]
             if keep_scroll and st["lv"] is not None and list_host.content is st["lv"]:
                 st["lv"].controls = rows                    # same ListView: the scroll position stays where it was
             else:
                 st["lv"] = list_host.content = ft.ListView(rows, spacing=0, expand=True, on_scroll=on_scroll, scroll_interval=10)
 
+        a.deck_sel_repaint = lambda: fill_list(keep_scroll=True)
         paint_tabs()
         fill_list()
         check_fill()
         return ft.Column([tab_row, spinner, list_host], spacing=0, expand=True)
 
-    return Screen(title="Decks", build=build, left=left, actions=actions, sig=bar_sig)
+    return Screen(title="Decks", build=build, left=left, actions=actions, sig=bar_sig,
+                  bar=bulk_decks.selection_bar)
 
 
-def deck_row(app: App, d: dict) -> ft.Control:
+def deck_row(app: App, d: dict, selected: bool = False) -> ft.Control:
+    """Tap opens the deck (or, while decks are selected, toggles it); long-press selects."""
     label = d["title"] or d["caption"] or d["deckId"]       # no title → the description
-    date = ft.Row([md_icon("calendar_today", 14, MINOR1), minor(fmt_date(d["lastModified"]), 12)], spacing=4, tight=True)
-    plays = ft.Row([castle_icon("play", 14, MINOR1), minor(f"{d['playCount']:,}", 12)], spacing=4, tight=True)
+    fg, fg2 = (BG, BG) if selected else (MAJOR, MINOR1)    # a selected row is white with black text
+    date = ft.Row([md_icon("calendar_today", 14, fg2), minor(fmt_date(d["lastModified"]), 12, fg2)], spacing=4, tight=True)
+    plays = ft.Row([castle_icon("play", 14, fg2), minor(f"{d['playCount']:,}", 12, fg2)], spacing=4, tight=True)
     local_dir: Optional[Path] = d["dir"]
+
+    def tap(e):
+        if app.deck_sel:
+            bulk_decks.toggle(app, d["deckId"], label)
+        else:
+            app.spawn(app.open_deck(d["deckId"], local_dir))
+
     return ft.Container(
         content=ft.Row([
             swatch(d["bg"], 36, d.get("cover", "")),
-            ft.Container(text(label, 15, medium=True, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS), expand=True),
+            ft.Container(text(label, 15, fg, medium=True, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS), expand=True),
             ft.Container(date, width=82),
             ft.Container(plays, width=52, alignment=ft.Alignment.CENTER_RIGHT),
         ], vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=10),
         padding=ft.Padding.symmetric(vertical=10, horizontal=14),
-        border=ft.Border(bottom=ft.BorderSide(1, SEP)), ink=True,
-        on_click=lambda e: app.spawn(app.open_deck(d["deckId"], local_dir)),
-        on_long_press=(lambda e: app.ask_delete_deck(local_dir, label)) if local_dir else None,
+        border=ft.Border(bottom=ft.BorderSide(1, SEP)), ink=True, bgcolor=MAJOR if selected else None,
+        on_click=tap,
+        on_long_press=lambda e: bulk_decks.toggle(app, d["deckId"], label),
     )
 
 

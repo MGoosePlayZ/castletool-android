@@ -83,7 +83,7 @@ row = lib.deck_row(app, lib.tab_decks(app, "LOCAL")[0])
 assert row.content.controls[1].content.value == "A caption about things"                # untitled => description
 assert len(row.content.controls) == 4 and row.on_long_press is not None                  # no visibility column; local rows can be deleted
 g = [i for i in lib.tab_decks(app, "GLOBAL") if i["deckId"] == "g-priv"][0]
-assert lib.deck_row(app, g).on_long_press is None and lib.deck_row(app, g).content.controls[1].content.value == "Only a description"
+assert lib.deck_row(app, g).on_long_press is not None and lib.deck_row(app, g).content.controls[1].content.value == "Only a description"
 assert lib.fmt_date("2026-10-12T10:00:00Z").count("/") == 2 and lib.fmt_date(None) == "--/--/--"
 
 # ---- screens

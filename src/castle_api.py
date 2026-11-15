@@ -275,6 +275,25 @@ class CastleAPI:
         )
         return data["decksForUser"] or []
 
+    def delete_deck(self, deck_id: str) -> None:
+        """Permanently delete a deck from Castle."""
+        self._call("mutation DeleteDeck($deckId: ID!) { deleteDeck(deckId: $deckId) }", {"deckId": deck_id})
+
+    def set_deck_visibility(self, deck_id: str, visibility: str, title: str = "", caption: str = "") -> str:
+        """public / unlisted / private. Sends just the visibility first; if Castle wants more
+        it is sent again with the title and description. Returns the visibility Castle reports."""
+        query = """mutation UpdateDeck($deck: DeckInput!) {
+          updateDeckV2(deck: $deck) { deckId title visibility caption }
+        }"""
+        try:
+            data = self._call(query, {"deck": {"deckId": deck_id, "visibility": visibility}})
+        except OfflineError:
+            raise
+        except CastleAPIError:
+            data = self._call(query, {"deck": {"deckId": deck_id, "visibility": visibility,
+                                               "title": title, "caption": caption}})
+        return ((data.get("updateDeckV2") or {}).get("visibility") or visibility)
+
     def card(self, card_id: str) -> Optional[dict]:
         data = self._call(
             "query($cardId: ID!) { card(cardId: $cardId) { cardId deckId } }",

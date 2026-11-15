@@ -20,6 +20,7 @@ import tasks
 import theme
 from app import Screen
 from cardbar import CardContext, card_bar
+from palettes import PALETTE_NAMES, PALETTES
 from screens_library import card_bg
 from theme import BG, MAJOR, MINOR1, SEP, castle_icon, md_icon, minor, text
 from widgets import ColorField, NumberBox, contrast_bg, icon_button, info_note, pill_button
@@ -704,14 +705,15 @@ class ImportDialog:
         if not (fixed_px and not vector):
             c.append(self.num("scale" if bitmap_like else "svg_scale", "Scale", 1, step=0.1, minimum=0.01, decimals=2))
         if bitmap_like:
-            c.append(self.switch("fixed_px", "Fixed Pixel Size", False, rebuild=True))
+            c.append(self.switch("fixed_px", "Original quality", False, rebuild=True))
             if fixed_px:
                 c.append(self.num("pixel_size", "Pixel size (Castle units)", 0.1, step=0.05, minimum=0.001, decimals=3))
-                c.append(info_note("Every pixel is drawn this wide and never resampled. Adding to a drawing that has "
-                                   "another pixel size resizes the new image to match it."))
+                c.append(info_note("One pixel per pixel, exactly as in the file: no smoothing, no reduced colors, no "
+                                   "palettes. Adding to a drawing that has another pixel size resizes the new image "
+                                   "to match it."))
         if not bitmap_like:
             c.append(self.num("steps", "Curve steps", 16, step=1, minimum=2, maximum=64))
-        if bitmap_like:
+        if bitmap_like and not (fixed_px and not vector):
             c.append(self.switch("smooth", "Smooth", False))
         if cat in ("animation", "video"):
             c.append(self.num("every", "Every Nth frame", 1, step=1, minimum=1))
@@ -732,16 +734,34 @@ class ImportDialog:
             on = bool(self.vals.get("color_on", False))
             c.append(self.switch("color_on", "Override color", False, rebuild=True))
             c.append(self.color("color", "#ffffff", enabled=on))
-        if bitmap_like:
+        if bitmap_like and not (fixed_px and not vector):
             c.append(self.switch("quantize_on", "Reduce colors", self.vals.get("quantize_on", False), rebuild=True))
             if self.vals.get("quantize_on"):
                 c.append(self.num("quantize_colors", "Colors", 256, step=8, minimum=1, maximum=256))
+            c.append(self.palette_picker())
         if cat == "video" and info["has_audio"]:
             if info.get("audio_unsupported"):
                 c.append(info_note("This device can't encode MP3, so this video's sound can't be uploaded."))
             else:
                 c.append(self.switch("want_audio", "Sound", True))
         return c
+
+    def palette_picker(self) -> ft.Control:
+        """Pick any number of fixed palettes; pixels snap to the nearest color of all of them (after Reduce colors)."""
+        chosen: set = self.vals.setdefault("palettes", set())
+
+        def toggle(e, name: str):
+            (chosen.add if e.control.value else chosen.discard)(name)
+            self.schedule_preview()
+
+        return ft.ExpansionTile(
+            title=text("Palettes" + (f" ({len(chosen)})" if chosen else ""), 14),
+            controls=[ft.Checkbox(label=f"{n} ({len(PALETTES[n])})", value=n in chosen,
+                                  on_change=lambda e, n=n: toggle(e, n), active_color=MAJOR, check_color=BG,
+                                  label_style=ft.TextStyle(font_family=theme.BODY, size=13)) for n in PALETTE_NAMES],
+            tile_padding=ft.Padding.all(0), controls_padding=ft.Padding.all(0), shape=ft.RoundedRectangleBorder(radius=0),
+            collapsed_shape=ft.RoundedRectangleBorder(radius=0), icon_color=MAJOR, collapsed_icon_color=MAJOR,
+            bgcolor=BG, collapsed_bgcolor=BG)
 
     def font_options(self) -> list[ft.Control]:
         c: list[ft.Control] = []
@@ -796,7 +816,8 @@ class ImportDialog:
         return "media", {
             "layout": v.get("layout", "frames"), "no_scale": bool(v.get("no_scale")),
             "scale": num("scale", 1), "smooth": bool(v.get("smooth")), "every": num("every", 1, int),
-            "quantize": quant, "svg_style": v.get("svg_style", "vector"), "svg_scale": num("svg_scale", 1),
+            "quantize": quant, "palettes": [n for n in PALETTE_NAMES if n in (v.get("palettes") or ())],
+            "svg_style": v.get("svg_style", "vector"), "svg_scale": num("svg_scale", 1),
             "steps": num("steps", 16, int),
             "color": ops.parse_color(v.get("color", "#ffffff")) if v.get("color_on") else None,
             "fps": num("fps", 4),
