@@ -17,8 +17,11 @@ class R:
     def raise_for_status(s):
         if not s.ok: raise RuntimeError("http")
     def json(s): return s.j
+    @property
+    def text(s): return json.dumps(s.j) if not isinstance(s.j, str) else s.j
 calls = []
 def fake(url, **kw):
+    assert "cb" in kw.get("params", {})
     calls.append(url); return R(DATA)
 bl.requests.get = fake
 bl._mem.update(t=0.0, data=None)
@@ -49,4 +52,5 @@ col = a.body.content.content
 assert col.controls[0].value == a.blocked_msg and col.controls[2].content.controls[0].value == "Close app"
 a.refresh_body(); a.refresh_bar(); a._show()
 assert a.body.content.content.controls[0].value == a.blocked_msg and a.signed_in
+assert bl.parse('{"list": {"A": "b",},}') == {"list": {"A": "b"}} and bl.parse("\ufeff{}") == {}   # trailing commas / BOM
 print("blocklist ok")

@@ -204,6 +204,8 @@ class App:
             return
         data = await asyncio.to_thread(blocklist.load, self.root / "blocklist.json")
         msg = blocklist.message_for(data, name)
+        if blocklist.last_error:
+            self.log(f"Blocklist: couldn't download it ({blocklist.last_error})", 2)
         if msg:
             self.log(f"Account {name} is blocked")
             self.blocked_msg = msg

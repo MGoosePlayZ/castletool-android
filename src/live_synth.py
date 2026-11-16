@@ -33,8 +33,6 @@ class Sink:
     def resume(self) -> None: ...
     def flush(self) -> None: ...                  # drop queued audio, keep state
     def close(self) -> None: ...
-    def queued(self) -> int:                      # samples written but not heard yet (the output buffer)
-        return 0
 
 
 class DesktopSink(Sink):
@@ -55,12 +53,6 @@ class DesktopSink(Sink):
 
     def write(self, pcm: bytes) -> None:
         self.stream.write(pcm)
-
-    def queued(self) -> int:
-        try:
-            return int(self.stream.latency * self.stream.samplerate)
-        except Exception:
-            return 0
 
     def pause(self) -> None:
         self.stream.abort()
@@ -92,28 +84,6 @@ class AndroidSink(Sink):
         self.AudioManager = autoclass("android.media.AudioManager")
         self.AudioFormat = autoclass("android.media.AudioFormat")
         self.track = None
-        self.written = 0                      # frames written since the last mark()
-        self.head0 = 0                        # the track's playback head at that moment
-
-    def _head(self) -> int:
-        return int(self.track.getPlaybackHeadPosition()) & 0xFFFFFFFF      # unsigned 32-bit frame counter
-
-    def mark(self) -> None:
-        """The queue was emptied (flush / start): count from here."""
-        self.written = 0
-        try:
-            self.head0 = self._head()
-        except Exception:
-            self.head0 = 0
-
-    def queued(self) -> int:
-        """Frames written but not yet played: the AudioTrack buffer is ~0.4 s, so the write pointer runs
-        that far ahead of what is heard."""
-        try:
-            played = (self._head() - self.head0) & 0xFFFFFFFF
-        except Exception:
-            return 0
-        return max(0, self.written - played)
 
     def open(self, sr: int) -> None:
         AF, AT = self.AudioFormat, self.AudioTrack
@@ -123,10 +93,8 @@ class AndroidSink(Sink):
         self.track = AT(self.AudioManager.STREAM_MUSIC, sr, AF.CHANNEL_OUT_MONO,
                         AF.ENCODING_PCM_16BIT, max(minbuf * 4, BLOCK * 2 * 4), AT.MODE_STREAM)
         self.track.play()
-        self.mark()
 
     def write(self, pcm: bytes) -> None:
-        self.written += len(pcm) // 2
         try:
             self.track.write(pcm, 0, len(pcm))
         except Exception:
@@ -138,7 +106,6 @@ class AndroidSink(Sink):
     def pause(self) -> None:
         self.track.pause()
         self.track.flush()
-        self.mark()
 
     def resume(self) -> None:
         self.track.play()
@@ -147,7 +114,6 @@ class AndroidSink(Sink):
         self.track.pause()
         self.track.flush()
         self.track.play()
-        self.mark()
 
     def close(self) -> None:
         if self.track is not None:
@@ -209,32 +175,15 @@ class LiveSynth:
         self._seek: Optional[int] = None
         self._thread: Optional[threading.Thread] = None
         self.error: Optional[str] = None
-        self._sink: Optional[Sink] = None
 
     # state ---------------------------------------------------------------
     @property
     def duration(self) -> float:
         return self.total / self.sr
 
-    def _heard(self) -> int:
-        """Sample position being HEARD. `pos` is how far the mixer has written; the audio output
-        buffer holds ~0.4 s of that, so what is audible trails `pos` by the sink's queue."""
-        pos = min(self.pos, self.total)
-        sink = self._sink
-        if not self._playing or sink is None:
-            return pos
-        try:
-            q = sink.queued()
-        except Exception:
-            return pos
-        heard = pos - q
-        if heard < 0:
-            heard = heard + self.total if (self.loop and self.total) else 0
-        return heard
-
     @property
     def position(self) -> float:
-        return self._heard() / self.sr
+        return min(self.pos, self.total) / self.sr
 
     @property
     def playing(self) -> bool:
@@ -299,18 +248,10 @@ class LiveSynth:
                 mix[d0:d0 + length] += buf[s0:s0 + length] * (note["vel"] / 127.0)
         return np.tanh(mix * 0.9)            # soft limiter
 
-    def _heard_before_pause(self, sink: Sink) -> int:
-        try:
-            heard = min(self.pos, self.total) - sink.queued()
-        except Exception:
-            return self.pos
-        return max(0, heard)
-
     def _run(self) -> None:
         try:
             sink = self.sink_factory()
             sink.open(self.sr)
-            self._sink = sink
         except Exception as ex:
             self.error = str(ex)
             self._playing = False
@@ -321,8 +262,6 @@ class LiveSynth:
                 with self._cond:
                     while not self._playing and not self._closed:
                         if not sink_paused:
-                            if self._seek is None:          # resume from what was heard, not from what was written
-                                self.pos = self._heard_before_pause(sink)
                             sink.pause()
                             sink_paused = True
                         self._cond.wait(0.2)
@@ -356,7 +295,6 @@ class LiveSynth:
             self.error = str(ex)
             self._playing = False
         finally:
-            self._sink = None
             sink.close()
 
 

@@ -142,11 +142,12 @@ bpf.write_text(_j.dumps({"entryId": "h", "title": "Hero", "entryType": "actorBlu
 ctx = cardbar.CardContext(app, d, "card1")
 app.push(lib.home_screen(app)); drain()
 view = sb.BlueprintView(app, ctx, bpf); view.tab = "media"; view.render(update=False)
-lv = [x for x in view.root.controls[2].content.controls if isinstance(x, ft.ReorderableListView)][0]
+lv = view.layer_list()          # the layer list is no longer on the Media tab (the art editor has layers), but its code is kept
 titles = lambda: [r.content.controls[1].content.value for r in lv.controls]
 assert titles() == ["Layer 3", "Layer 2", "Layer 1"] and lv.show_default_drag_handles is False        # top layer first
 assert isinstance(lv.controls[0].content.controls[0], ft.ReorderableDragHandle)
-btn = view.root.controls[2].content.controls[1]; assert btn.controls[0].content.controls[-1].value == "New Layer" and btn.alignment == ft.MainAxisAlignment.START
+btn = view.root.controls[2].content.controls[1]; assert btn.controls[0].content.controls[-1].value == "Open Editor" and btn.alignment == ft.MainAxisAlignment.START
+assert not any(isinstance(x, ft.ReorderableListView) for x in view.root.controls[2].content.controls)
 # drag "Layer 1" (display index 2) to the top (display index 0)
 view.on_reorder_layers(type("E", (), {"old_index": 2, "new_index": 0})())
 assert [l["title"] for l in ops.drawing_layers(ops.load_blueprint(bpf))] == ["Layer 2", "Layer 3", "Layer 1"] and ctx.session.dirty

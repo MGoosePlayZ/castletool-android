@@ -116,8 +116,8 @@ def max_scroll(m: RollerModel, box_w: float, box_h: float) -> float:
     return max(0.0, (m.end + 1) * m.cell(box_h) - box_w * 0.5)
 
 
-def render_layer(m: RollerModel, box_w: float, box_h: float, ox: float, sc: int = 2) -> Image.Image:
-    """The static picture (rows, grid, notes) of the world strip [ox, ox + box_w), without needle or frame."""
+def render_png(m: RollerModel, box_w: float, box_h: float, ox: float, needle: float, sc: int = 2) -> bytes:
+    """One frame. The image is (box_w + 2*SM) x (box_h + HM) logical px, at `sc` device px per logical px."""
     c = m.cell(box_h)
     bw, bh = round(box_w * sc), round(box_h * sc)
     layer = Image.new("RGB", (bw, bh), (0, 0, 0))
@@ -156,35 +156,7 @@ def render_layer(m: RollerModel, box_w: float, box_h: float, ox: float, sc: int 
         x, y = X(s), Y(m.rows[i])
         d.rectangle([round(x * sc), round(y * sc), max(round(x * sc), round((x + sz) * sc) - 1),
                      max(round(y * sc), round((y + sz) * sc) - 1)], fill=m.colors[m.tracks[i]])
-    return layer
-
-
-def render_tile_png(m: RollerModel, tile_w: int, box_h: float, k: int, sc: int = 2) -> bytes:
-    """Tile `k` of the song: the strip [k * tile_w, (k + 1) * tile_w) in world pixels. tile_w is a whole number,
-    so neighbouring tiles line up to the device pixel."""
-    buf = io.BytesIO()
-    render_layer(m, tile_w, box_h, k * tile_w, sc).save(buf, format="PNG", compress_level=1)
-    return buf.getvalue()
-
-
-def render_handle_png(sc: int = 3) -> bytes:
-    """The needle's rounded house-shaped handle (22 x 26 logical px), pointing down."""
-    img = Image.new("RGBA", (22 * sc, 26 * sc), (0, 0, 0, 0))
-    pts = [(0, 0), (22, 0), (22, 13), (11, 26), (0, 13)]
-    ImageDraw.Draw(img).polygon([(x * sc, y * sc) for x, y in _rounded_poly(pts, 4)], fill=(255, 255, 255))
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def render_png(m: RollerModel, box_w: float, box_h: float, ox: float, needle: float, sc: int = 2) -> bytes:
-    """One whole frame (box, needle and handle). The image is (box_w + 2*SM) x (box_h + HM) logical px,
-    at `sc` device px per logical px. (The app draws tiles + a native needle instead; this is the reference.)"""
-    c = m.cell(box_h)
-    bw, bh = round(box_w * sc), round(box_h * sc)
-    layer = render_layer(m, box_w, box_h, ox, sc)
-    d = ImageDraw.Draw(layer)
-    nx = needle * c - ox
+    nx = X(needle)
     x0 = round((nx - 0.75) * sc)
     d.rectangle([x0, round(10 * sc), max(x0 + 1, round((nx + 0.75) * sc)), bh - 1], fill=(255, 255, 255))
 
@@ -204,22 +176,13 @@ def render_png(m: RollerModel, box_w: float, box_h: float, ox: float, needle: fl
 
 # ── control ───────────────────────────────────────────────────────────────
 
-TILES_KEEP = 8          # rendered tile PNGs kept in memory
-FRAME_S = 1 / 30        # needle update interval while playing
-
-
 class PianoRoller:
-    """Roller + in-box play/stop and follow buttons, driven by a live_synth.LiveSynth.
-
-    The rows, grid and notes are drawn ONCE per tile (one box wide) and then only moved; the needle and
-    its handle are native controls moved every frame. So playing costs a few property updates per frame
-    instead of drawing and sending a whole new picture (which made the needle stutter and trail the sound)."""
+    """Roller + in-box play/stop and follow buttons, driven by a live_synth.LiveSynth."""
 
     def __init__(self, app, eng, model: RollerModel, width: float, on_error: Callable[[str], None]):
         self.app, self.eng, self.m = app, eng, model
         self.on_error = on_error
         self.bw = max(140.0, width - 2 * SM)
-        self.tw = int(self.bw)                     # tile width in whole logical px (tiles line up exactly)
         self.bh = self.bw / RATIO
         self.ox = 0.0
         self.needle = 0.0                          # steps
@@ -230,27 +193,16 @@ class PianoRoller:
         self.dirty = True
         self._shown_playing: Optional[bool] = None
         self._shown_follow: Optional[bool] = None
-        self.cache: dict[int, bytes] = {}          # tile index -> PNG (oldest first)
-        self.slots: dict[int, ft.Image] = {}       # tile index -> the image on screen
-        self.busy: set[int] = set()                # tiles being drawn in the background
-        self.needle_line = ft.Container(width=1.5, height=self.bh - 10, top=10, left=-1, bgcolor=MAJOR)
-        self.strip = ft.Stack([self.needle_line], width=self.bw, height=self.bh)
-        self.box = ft.Container(self.strip, left=SM, top=HM, width=self.bw, height=self.bh, bgcolor=BG,
-                                border_radius=12, clip_behavior=ft.ClipBehavior.ANTI_ALIAS)
-        self.outline = ft.Container(left=SM, top=HM, width=self.bw, height=self.bh, border_radius=12,
-                                    border=ft.Border.all(1, GRAY))
-        self.handle = ft.Image(src=render_handle_png(), width=22, height=26, fit=ft.BoxFit.FILL,
-                               left=SM - 11, top=HM - 13)
+        self.img = ft.Image(src=render_png(model, self.bw, self.bh, 0, 0), width=self.bw + 2 * SM,
+                            height=self.bh + HM, fit=ft.BoxFit.FILL, gapless_playback=True)
         self.play_btn = self._button("play_music", self.toggle, HM + 8)
         self.follow_btn = self._button("follow_needle", self.toggle_follow, HM + 56)
-        hit = ft.Container(width=self.bw + 2 * SM, height=self.bh + HM, bgcolor="#01000000")   # catches drags everywhere
-        self.control = ft.GestureDetector(
-            content=ft.Stack([hit, self.box, self.outline, self.handle, self.play_btn, self.follow_btn],
-                             width=self.bw + 2 * SM, height=self.bh + HM),
-            on_pan_start=self._down, on_pan_update=self._move, on_pan_end=self._up, on_pan_cancel=self._up,
-            drag_interval=20)
+        self.control = ft.Stack([
+            ft.GestureDetector(content=self.img, on_pan_start=self._down, on_pan_update=self._move,
+                               on_pan_end=self._up, on_pan_cancel=self._up, drag_interval=20),
+            self.play_btn, self.follow_btn,
+        ], width=self.bw + 2 * SM, height=self.bh + HM)
         self._paint_buttons()
-        self._layout()
 
     def _button(self, icon: str, on_click, top: float):
         return ft.Container(content=castle_icon(icon, 20), width=40, height=40, border_radius=12,
@@ -269,58 +221,6 @@ class PianoRoller:
             self.follow_btn.content = castle_icon("follow_needle", 20, BG if self.follow else MINOR1)
             self.follow_btn.bgcolor = MAJOR if self.follow else BG
             self.follow_btn.border = ft.Border.all(1, MAJOR if self.follow else MINOR1)
-
-    # tiles ---------------------------------------------------------------------
-    def _last_tile(self) -> int:
-        return int((max_scroll(self.m, self.bw, self.bh) + self.bw) // self.tw) + 1
-
-    def _tile(self, k: int) -> bytes:
-        png = self.cache.get(k)
-        if png is None:
-            png = self.cache[k] = render_tile_png(self.m, self.tw, self.bh, k)
-        else:
-            self.cache[k] = self.cache.pop(k)              # most recently used goes last
-        return png
-
-    async def _prefetch(self, k: int):
-        try:
-            png = await asyncio.to_thread(render_tile_png, self.m, self.tw, self.bh, k)
-            self.cache.setdefault(k, png)
-        except Exception:
-            pass
-        finally:
-            self.busy.discard(k)
-
-    def _layout(self):
-        """Put every moving part where it belongs. Only property changes; no picture is drawn here
-        except the one tile that scrolls into view (and was not prefetched)."""
-        c = self.m.cell(self.bh)
-        nx = self.needle * c - self.ox
-        self.needle_line.left = round(nx - 0.75, 1)
-        self.handle.left = round(SM + nx - 11, 1)
-        self.handle.visible = -SM <= nx <= self.bw + SM
-        k0 = max(0, int(self.ox // self.tw))
-        last = self._last_tile()
-        want = [k for k in (k0, k0 + 1, k0 + 2) if k <= last]
-        changed = False
-        for k in want:
-            if k not in self.slots and (k <= k0 + 1 or k in self.cache):     # k0 + 2 only once it is ready
-                self.slots[k] = ft.Image(src=self._tile(k), width=self.tw, height=self.bh, fit=ft.BoxFit.FILL,
-                                         gapless_playback=True, top=0)
-                changed = True
-        for k in [k for k in self.slots if k not in want]:
-            del self.slots[k]
-            changed = True
-        for k, img in self.slots.items():
-            img.left = k * self.tw - self.ox
-        if changed:
-            self.strip.controls = [self.slots[k] for k in sorted(self.slots)] + [self.needle_line]
-        for k in (k0 + 2, k0 + 3, k0 - 1):                                   # draw what is coming, off the UI path
-            if 0 <= k <= last and k not in self.cache and k not in self.busy:
-                self.busy.add(k)
-                self.app.page.run_task(self._prefetch, k)
-        while len(self.cache) > TILES_KEEP:
-            self.cache.pop(next(iter(self.cache)))
 
     # transport -------------------------------------------------------------
     def toggle(self, e=None):
@@ -385,7 +285,7 @@ class PianoRoller:
     # drawing -----------------------------------------------------------------
     def _frame(self):
         self._paint_buttons()
-        self._layout()
+        self.img.src = render_png(self.m, self.bw, self.bh, self.ox, self.needle)
         self.dirty = False
         self.app.page.update()
 
@@ -407,7 +307,7 @@ class PianoRoller:
                     self.ox = max(0.0, self.ox - 8)
                     self._needle_to(self.last_x)
             elif playing:
-                self.needle = eng.position / m.sec             # position of the sound being HEARD
+                self.needle = eng.position / m.sec
                 if self.follow:
                     c = m.cell(self.bh)
                     lim, nx = self.bw * 0.4, self.needle * c - self.ox
@@ -421,4 +321,4 @@ class PianoRoller:
             was_playing = playing
             if self.dirty or playing != self._shown_playing:
                 self._frame()
-            await asyncio.sleep(FRAME_S if (playing or self.mode) else 0.15)
+            await asyncio.sleep(0.06 if (playing or self.mode) else 0.15)

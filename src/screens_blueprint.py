@@ -21,6 +21,7 @@ import theme
 from app import Screen
 from cardbar import CardContext, card_bar
 from palettes import PALETTE_NAMES, PALETTES
+from screens_art import art_screen
 from screens_library import card_bg
 from theme import BG, MAJOR, MINOR1, SEP, castle_icon, md_icon, minor, text
 from widgets import ColorField, NumberBox, contrast_bg, icon_button, info_note, pill_button
@@ -173,10 +174,14 @@ class BlueprintView:
             out.append(self.preview_block(d2))
         else:
             out.append(ft.Container(castle_icon("pencil", 30, MINOR1), height=140, alignment=ft.Alignment.CENTER))
-        out.append(ft.Row([pill_button("New Layer", lambda e: self.app.spawn(self.on_pick_layer(lyr.NEW)),
-                                       castle_icon("add", 18, BG), filled=True)],
-                          alignment=ft.MainAxisAlignment.START))
-        out.append(self.layer_list())
+        if d2 and drawing.frame_count(d2):
+            out.append(ft.Row([pill_button("Open Editor", lambda e: self.open_editor(),
+                                           castle_icon("pencil", 18, BG), filled=True)],
+                              alignment=ft.MainAxisAlignment.START))
+        else:                                    # nothing to edit yet: the first image becomes the drawing
+            out.append(ft.Row([pill_button("Add Image", lambda e: self.app.spawn(self.on_pick_layer(lyr.NEW)),
+                                           castle_icon("add", 18, BG), filled=True)],
+                              alignment=ft.MainAxisAlignment.START))
         out.append(self.log_box())
         return ft.Column(out, spacing=10)
 
@@ -288,6 +293,18 @@ class BlueprintView:
                          horizontal_alignment=ft.CrossAxisAlignment.STRETCH)
 
     # ── layers ────────────────────────────────────────────────────────────
+    def open_editor(self):
+        """The art editor replaces the old layer list: layers, frames, drawing and image import all live there."""
+        d2 = drawing.get_drawing2(self.bp)
+        if not d2:
+            self.app.toast("This blueprint has no drawing.", error=True)
+            return
+        try:
+            self.app.push(art_screen(self.app, self.ctx, self.bp_path, d2, self))
+        except Exception as ex:
+            self.app.log(f"error: art editor: {ex}")
+            self.app.toast(f"Couldn't open the editor: {ex}", error=True)
+
     def layer_list(self) -> ft.Control:
         """Top layer first (like Castle's own layer list). Hold a layer's menu icon to drag it."""
         layers = ops.drawing_layers(self.bp)

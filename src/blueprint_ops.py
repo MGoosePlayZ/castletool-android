@@ -192,6 +192,14 @@ def rename_layer(bp_path: Path, layer_id: str, name: str) -> None:
     _edit_drawing(bp_path, lambda d2: lyr.rename_layer(d2, layer_id, name))
 
 
+def set_draw_data(bp_path: Path, draw_data: dict) -> None:
+    """Replace the drawing's drawData (what the art editor produces); the rest of the blueprint is untouched."""
+    def fn(d2: dict) -> None:
+        d2["drawData"] = draw_data
+        lyr._rehash(d2)
+    _edit_drawing(bp_path, fn)
+
+
 def delete_layer(bp_path: Path, layer_id: str) -> None:
     _edit_drawing(bp_path, lambda d2: lyr.delete_layer(d2, layer_id))
 
